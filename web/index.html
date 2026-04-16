@@ -94,14 +94,20 @@
         flex-wrap: wrap;
       }
 
-      .brand-mark {
-        display: none;
+      .brand-copy {
+        display: flex;
+        align-items: center;
       }
 
       .brand-copy h1 {
         margin: 0;
-        font-size: 18px;
-        line-height: 1.1;
+        line-height: 0;
+      }
+
+      .brand-copy h1 img {
+        display: block;
+        height: 50px;
+        width: auto;
       }
 
       .brand-copy p {
@@ -780,9 +786,8 @@
       <section class="panel topbar">
         <div class="topbar-row">
           <div class="brand">
-            <div class="brand-mark">T</div>
             <div class="brand-copy">
-              <h1>Traffic Monitor</h1>
+              <h1><img src="/favicon.svg" alt="Traffic Monitor" /></h1>
               <p>单屏流量监控面板，聚合统计、趋势和钻取明细集中展示。</p>
             </div>
             <div class="dimension-tabs" role="tablist" aria-label="聚合维度">
