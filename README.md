@@ -84,4 +84,5 @@ docker run -d \
 
 ## 致谢
 
-页面接口参考了 [MetaCubeX/metacubexd](https://github.com/MetaCubeX/metacubexd)。
+页面接口参考了 [MetaCubeX/metacubexd](https://github.com/MetaCubeX/metacubexd)。  
+[LinuxDO](https://linux.do) — the community where it all began
