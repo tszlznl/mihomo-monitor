@@ -119,3 +119,48 @@ jobs:
           files: traffic-monitor-*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-macos-arm64:
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/}
+          else
+            VERSION=manual-${GITHUB_RUN_NUMBER}
+          fi
+          VERSION=${VERSION#v}
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Build macOS arm64 binary
+        working-directory: ${{ env.APP_DIR }}
+        env:
+          CGO_ENABLED: "1"
+          GOOS: darwin
+          GOARCH: arm64
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+          OUTPUT_NAME=traffic-monitor-darwin-arm64
+          echo "Building $OUTPUT_NAME version $VERSION"
+          go build -ldflags="-s -w" -o "./$OUTPUT_NAME" main.go
+          chmod +x "./$OUTPUT_NAME"
+
+      - name: Upload macOS binary to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: traffic-monitor-darwin-arm64
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
