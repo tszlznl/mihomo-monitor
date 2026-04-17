@@ -575,6 +575,49 @@ func TestEmbeddedIndexDisablesPeriodicAutoRefresh(t *testing.T) {
 	}
 }
 
+func TestEmbeddedIndexIncludesGithubAndLicenseFooter(t *testing.T) {
+	content, err := webAssets.ReadFile("web/index.html")
+	if err != nil {
+		t.Fatalf("read embedded index.html: %v", err)
+	}
+
+	html := string(content)
+	for _, want := range []string{
+		`href="https://github.com/zhf883680/clash-traffic-monitor"`,
+		`>GitHub<`,
+		`href="/LICENSE"`,
+		`>MIT License<`,
+	} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("expected embedded index.html to contain %q", want)
+		}
+	}
+}
+
+func TestRoutesServeLicense(t *testing.T) {
+	svc := newTestService(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/LICENSE", nil)
+	rec := httptest.NewRecorder()
+
+	svc.routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", rec.Code, rec.Body.String())
+	}
+	if contentType := rec.Header().Get("Content-Type"); !strings.Contains(contentType, "text/plain") {
+		t.Fatalf("expected text/plain content type, got %q", contentType)
+	}
+	for _, want := range []string{
+		"MIT License",
+		"Permission is hereby granted, free of charge",
+	} {
+		if !strings.Contains(rec.Body.String(), want) {
+			t.Fatalf("expected license response to contain %q", want)
+		}
+	}
+}
+
 func newTestService(t *testing.T) *service {
 	t.Helper()
 

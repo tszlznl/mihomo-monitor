@@ -335,6 +335,56 @@
         grid-template-rows: auto auto 1fr;
       }
 
+      .site-footer {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+        padding: 14px 18px;
+      }
+
+      .footer-text {
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .footer-links {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        flex-wrap: wrap;
+      }
+
+      .footer-link {
+        display: inline-flex;
+        align-items: center;
+        min-height: 38px;
+        padding: 0 14px;
+        border-radius: 999px;
+        border: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.86);
+        color: var(--muted-strong);
+        font-weight: 700;
+        text-decoration: none;
+        transition:
+          transform 180ms ease,
+          box-shadow 180ms ease,
+          border-color 180ms ease,
+          color 180ms ease;
+      }
+
+      .footer-link:hover {
+        transform: translateY(-1px);
+        border-color: var(--accent-border);
+        color: var(--accent);
+        box-shadow: 0 10px 20px rgba(95, 70, 255, 0.12);
+      }
+
+      .footer-link:focus {
+        outline: none;
+        box-shadow: 0 0 0 3px rgba(95, 70, 255, 0.14);
+      }
+
       .panel-head {
         display: flex;
         justify-content: space-between;
@@ -759,6 +809,11 @@
           justify-content: stretch;
         }
 
+        .site-footer {
+          flex-direction: column;
+          align-items: flex-start;
+        }
+
         .toolbar-group {
           flex-direction: column;
           align-items: stretch;
@@ -921,6 +976,22 @@
           </div>
         </section>
       </section>
+
+      <footer class="panel site-footer">
+        <div class="footer-text">开源协议：MIT</div>
+        <div class="footer-links">
+          <a
+            class="footer-link"
+            href="https://github.com/zhf883680/clash-traffic-monitor"
+            target="_blank"
+            rel="noopener noreferrer"
+            >GitHub</a
+          >
+          <a class="footer-link" href="/LICENSE" target="_blank" rel="noopener noreferrer"
+            >MIT License</a
+          >
+        </div>
+      </footer>
     </div>
 
     <script>

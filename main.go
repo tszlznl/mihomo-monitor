@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"embed"
@@ -23,7 +24,7 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
-//go:embed web/*
+//go:embed LICENSE web/*
 var webAssets embed.FS
 
 const (
@@ -660,6 +661,7 @@ func (s *service) routes() http.Handler {
 		panic(err)
 	}
 	fileServer := http.FileServer(http.FS(staticFS))
+	mux.HandleFunc("/LICENSE", s.handleLicense)
 	mux.Handle("/", fileServer)
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/api/traffic/aggregate", s.handleAggregate)
@@ -684,6 +686,22 @@ func (s *service) withCORS(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func (s *service) handleLicense(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeMethodNotAllowed(w)
+		return
+	}
+
+	content, err := webAssets.ReadFile("LICENSE")
+	if err != nil {
+		http.Error(w, "license unavailable", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	http.ServeContent(w, r, "LICENSE", time.Time{}, bytes.NewReader(content))
 }
 
 func (s *service) handleHealth(w http.ResponseWriter, r *http.Request) {
