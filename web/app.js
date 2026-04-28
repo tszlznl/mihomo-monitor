@@ -26,6 +26,14 @@ const drilldownConfig = {
 }
 
 const DIMENSION_STORAGE_KEY = "traffic-monitor:selected-dimension"
+const autoSwitchStatusLabels = {
+  switched: "已切换目标节点",
+  skipped: "无需切换",
+  error: "切换失败",
+  restored: "已恢复原节点",
+  restore_skipped: "恢复已取消",
+  restore_error: "恢复失败",
+}
 
 const elements = {
   dimension: document.getElementById("dimension"),
@@ -52,8 +60,10 @@ const elements = {
   autoSwitchPanel: document.getElementById("autoSwitchPanel"),
   autoSwitchForm: document.getElementById("autoSwitchForm"),
   autoSwitchEnabled: document.getElementById("autoSwitchEnabled"),
+  autoRestoreEnabled: document.getElementById("autoRestoreEnabled"),
   autoSwitchThreshold: document.getElementById("autoSwitchThreshold"),
   autoSwitchCooldown: document.getElementById("autoSwitchCooldown"),
+  autoRestoreQuietMinutes: document.getElementById("autoRestoreQuietMinutes"),
   autoSwitchRefreshBtn: document.getElementById("autoSwitchRefreshBtn"),
   autoSwitchSaveBtn: document.getElementById("autoSwitchSaveBtn"),
   autoSwitchCancelBtn: document.getElementById("autoSwitchCancelBtn"),
@@ -103,6 +113,8 @@ const state = {
     enabled: false,
     thresholdBytesPerMinute: 0,
     cooldownSeconds: 0,
+    restoreEnabled: false,
+    restoreQuietMinutes: 0,
     groupTargets: [],
     groups: [],
     events: [],
@@ -416,10 +428,16 @@ function mergeAutoSwitchGroups(groups, groupTargets) {
 
 function syncAutoSwitchForm() {
   elements.autoSwitchEnabled.checked = Boolean(state.autoSwitch.enabled)
+  elements.autoRestoreEnabled.checked = Boolean(state.autoSwitch.restoreEnabled)
   elements.autoSwitchThreshold.value = bytesToMegabytes(state.autoSwitch.thresholdBytesPerMinute)
   elements.autoSwitchCooldown.value = secondsToMinutes(state.autoSwitch.cooldownSeconds)
+  elements.autoRestoreQuietMinutes.value = Number(state.autoSwitch.restoreQuietMinutes || 0)
   renderAutoSwitchGroups()
   renderAutoSwitchEvents()
+}
+
+function formatAutoSwitchStatus(status) {
+  return autoSwitchStatusLabels[status] || status || "--"
 }
 
 function renderAutoSwitchGroups() {
@@ -472,25 +490,30 @@ function renderAutoSwitchEvents() {
 
   elements.autoSwitchEventsBody.innerHTML = state.autoSwitch.events
     .map((event) => {
+      const isRestoreEvent = !event.host && Number(event.totalBytes || 0) === 0
       const results = (event.results || [])
         .map((result) => {
           const extra = result.message ? ` · ${escapeHTML(result.message)}` : ""
-          return `<div class="auto-switch-result">${escapeHTML(result.groupName)} -> ${escapeHTML(result.targetProxy)} · ${escapeHTML(result.status)}${extra}</div>`
+          return `<div class="auto-switch-result">${escapeHTML(result.groupName)} -> ${escapeHTML(result.targetProxy)} · ${escapeHTML(formatAutoSwitchStatus(result.status))}${extra}</div>`
         })
         .join("")
 
       const errorLine = event.error
         ? `<div class="auto-switch-event-error">${escapeHTML(event.error)}</div>`
         : ""
+      const title = isRestoreEvent ? "自动恢复检查" : event.host || "Unknown"
+      const trafficLine = isRestoreEvent
+        ? `<span>静默窗口到期后检查恢复条件</span>`
+        : `<span>分钟累计 ${escapeHTML(formatBytes(event.totalBytes || 0))}</span>`
 
       return `
         <article class="auto-switch-event-card">
           <div class="auto-switch-event-top">
-            <strong>${escapeHTML(event.host || "Unknown")}</strong>
+            <strong>${escapeHTML(title)}</strong>
             <span>${escapeHTML(formatDateTime(event.triggeredAt))}</span>
           </div>
           <div class="auto-switch-event-meta">
-            <span>分钟累计 ${escapeHTML(formatBytes(event.totalBytes || 0))}</span>
+            ${trafficLine}
             <span>窗口 ${escapeHTML(formatDateTime(event.windowStart))} - ${escapeHTML(formatDateTime(event.windowEnd))}</span>
           </div>
           <div class="auto-switch-result-list">${results || '<div class="auto-switch-result">没有执行记录</div>'}</div>
@@ -506,6 +529,8 @@ async function loadAutoSwitchSettings() {
   state.autoSwitch.enabled = Boolean(settings.enabled)
   state.autoSwitch.thresholdBytesPerMinute = Number(settings.thresholdBytesPerMinute || 0)
   state.autoSwitch.cooldownSeconds = Number(settings.cooldownSeconds || 0)
+  state.autoSwitch.restoreEnabled = Boolean(settings.restoreEnabled)
+  state.autoSwitch.restoreQuietMinutes = Number(settings.restoreQuietMinutes || 0)
   state.autoSwitch.groupTargets = Array.isArray(settings.groupTargets) ? settings.groupTargets : []
 }
 
@@ -625,6 +650,8 @@ async function saveAutoSwitchSettings(event) {
     enabled: elements.autoSwitchEnabled.checked,
     thresholdBytesPerMinute: megabytesToBytes(elements.autoSwitchThreshold.value),
     cooldownSeconds: Math.max(0, Number(elements.autoSwitchCooldown.value || 0)) * 60,
+    restoreEnabled: elements.autoRestoreEnabled.checked,
+    restoreQuietMinutes: Math.max(0, Number(elements.autoRestoreQuietMinutes.value || 0)),
     groupTargets: collectAutoSwitchGroupTargets(),
   }
 
@@ -636,6 +663,8 @@ async function saveAutoSwitchSettings(event) {
     state.autoSwitch.enabled = Boolean(saved.enabled)
     state.autoSwitch.thresholdBytesPerMinute = Number(saved.thresholdBytesPerMinute || 0)
     state.autoSwitch.cooldownSeconds = Number(saved.cooldownSeconds || 0)
+    state.autoSwitch.restoreEnabled = Boolean(saved.restoreEnabled)
+    state.autoSwitch.restoreQuietMinutes = Number(saved.restoreQuietMinutes || 0)
     state.autoSwitch.groupTargets = Array.isArray(saved.groupTargets) ? saved.groupTargets : []
     state.autoSwitch.groups = mergeAutoSwitchGroups(state.autoSwitch.groups, state.autoSwitch.groupTargets)
     state.autoSwitchOpen = false

@@ -55,6 +55,8 @@ type autoSwitchSettings struct {
 	Enabled                 bool                    `json:"enabled"`
 	ThresholdBytesPerMinute int64                   `json:"thresholdBytesPerMinute"`
 	CooldownSeconds         int64                   `json:"cooldownSeconds"`
+	RestoreEnabled          bool                    `json:"restoreEnabled"`
+	RestoreQuietMinutes     int64                   `json:"restoreQuietMinutes"`
 	GroupTargets            []autoSwitchGroupTarget `json:"groupTargets"`
 }
 
@@ -80,6 +82,15 @@ type autoSwitchEvent struct {
 	WindowEnd   int64                       `json:"windowEnd"`
 	Results     []autoSwitchExecutionResult `json:"results"`
 	Error       string                      `json:"error"`
+}
+
+type autoRestoreSession struct {
+	GroupName          string `json:"groupName"`
+	OriginalProxy      string `json:"originalProxy"`
+	CurrentProxy       string `json:"currentProxy"`
+	LastTriggeredAt    int64  `json:"lastTriggeredAt"`
+	LastTriggeredHost  string `json:"lastTriggeredHost"`
+	LastTriggeredBytes int64  `json:"lastTriggeredBytes"`
 }
 
 type controllableProxyGroup struct {
@@ -212,14 +223,14 @@ func main() {
 	}
 
 	svc := &service{
-		db:              db,
-		client:          &http.Client{Timeout: 10 * time.Second},
-		now:             time.Now,
-		cfg:             cfg,
-		mihomoSettings:  runtimeSettings,
-		lastConnections: make(map[string]connection),
-		lastVacuum:      time.Now(),
-		aggregateBuffer: make(map[string]*aggregatedEntry),
+		db:                db,
+		client:            &http.Client{Timeout: 10 * time.Second},
+		now:               time.Now,
+		cfg:               cfg,
+		mihomoSettings:    runtimeSettings,
+		lastConnections:   make(map[string]connection),
+		lastVacuum:        time.Now(),
+		aggregateBuffer:   make(map[string]*aggregatedEntry),
 		hostMinuteWindows: make(map[string]*hostTrafficWindow),
 	}
 
@@ -360,6 +371,15 @@ func openDatabase(path string) (*sql.DB, error) {
 		error TEXT NOT NULL DEFAULT ''
 	);
 
+	CREATE TABLE IF NOT EXISTS auto_restore_sessions (
+		group_name TEXT PRIMARY KEY,
+		original_proxy TEXT NOT NULL,
+		current_proxy TEXT NOT NULL,
+		last_triggered_at INTEGER NOT NULL,
+		last_triggered_host TEXT NOT NULL DEFAULT '',
+		last_triggered_bytes INTEGER NOT NULL DEFAULT 0
+	);
+
 	CREATE INDEX IF NOT EXISTS idx_auto_switch_events_triggered_at ON auto_switch_events(triggered_at DESC);
 	`
 
@@ -476,7 +496,13 @@ func loadAutoSwitchSettings(db *sql.DB) (autoSwitchSettings, error) {
 	rows, err := db.Query(`
 		SELECT key, value
 		FROM app_settings
-		WHERE key IN ('auto_switch_enabled', 'auto_switch_threshold_bytes_per_minute', 'auto_switch_cooldown_seconds')
+		WHERE key IN (
+			'auto_switch_enabled',
+			'auto_switch_threshold_bytes_per_minute',
+			'auto_switch_cooldown_seconds',
+			'auto_restore_enabled',
+			'auto_restore_quiet_minutes'
+		)
 	`)
 	if err != nil {
 		return autoSwitchSettings{}, err
@@ -501,6 +527,13 @@ func loadAutoSwitchSettings(db *sql.DB) (autoSwitchSettings, error) {
 			}
 		case "auto_switch_cooldown_seconds":
 			settings.CooldownSeconds, err = strconv.ParseInt(value, 10, 64)
+			if err != nil {
+				return autoSwitchSettings{}, err
+			}
+		case "auto_restore_enabled":
+			settings.RestoreEnabled = value == "1"
+		case "auto_restore_quiet_minutes":
+			settings.RestoreQuietMinutes, err = strconv.ParseInt(value, 10, 64)
 			if err != nil {
 				return autoSwitchSettings{}, err
 			}
@@ -546,9 +579,14 @@ func saveAutoSwitchSettings(db *sql.DB, settings autoSwitchSettings) error {
 		"auto_switch_enabled":                    "0",
 		"auto_switch_threshold_bytes_per_minute": strconv.FormatInt(settings.ThresholdBytesPerMinute, 10),
 		"auto_switch_cooldown_seconds":           strconv.FormatInt(settings.CooldownSeconds, 10),
+		"auto_restore_enabled":                   "0",
+		"auto_restore_quiet_minutes":             strconv.FormatInt(settings.RestoreQuietMinutes, 10),
 	}
 	if settings.Enabled {
 		values["auto_switch_enabled"] = "1"
+	}
+	if settings.RestoreEnabled {
+		values["auto_restore_enabled"] = "1"
 	}
 
 	for key, value := range values {
@@ -603,6 +641,81 @@ func insertAutoSwitchEvent(db *sql.DB, event autoSwitchEvent) error {
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 	`, event.TriggeredAt, event.Host, event.TotalBytes, event.WindowStart, event.WindowEnd, string(resultsJSON), event.Error)
 	return err
+}
+
+func upsertAutoRestoreSession(db *sql.DB, session autoRestoreSession) error {
+	_, err := db.Exec(`
+		INSERT INTO auto_restore_sessions
+		(group_name, original_proxy, current_proxy, last_triggered_at, last_triggered_host, last_triggered_bytes)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(group_name) DO UPDATE SET
+			original_proxy = excluded.original_proxy,
+			current_proxy = excluded.current_proxy,
+			last_triggered_at = excluded.last_triggered_at,
+			last_triggered_host = excluded.last_triggered_host,
+			last_triggered_bytes = excluded.last_triggered_bytes
+	`, session.GroupName, session.OriginalProxy, session.CurrentProxy, session.LastTriggeredAt, session.LastTriggeredHost, session.LastTriggeredBytes)
+	return err
+}
+
+func listAutoRestoreSessions(db *sql.DB) ([]autoRestoreSession, error) {
+	rows, err := db.Query(`
+		SELECT group_name, original_proxy, current_proxy, last_triggered_at, last_triggered_host, last_triggered_bytes
+		FROM auto_restore_sessions
+		ORDER BY group_name ASC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	sessions := make([]autoRestoreSession, 0)
+	for rows.Next() {
+		var session autoRestoreSession
+		if err := rows.Scan(
+			&session.GroupName,
+			&session.OriginalProxy,
+			&session.CurrentProxy,
+			&session.LastTriggeredAt,
+			&session.LastTriggeredHost,
+			&session.LastTriggeredBytes,
+		); err != nil {
+			return nil, err
+		}
+		sessions = append(sessions, session)
+	}
+
+	return sessions, rows.Err()
+}
+
+func deleteAutoRestoreSession(db *sql.DB, groupName string) error {
+	_, err := db.Exec(`DELETE FROM auto_restore_sessions WHERE group_name = ?`, groupName)
+	return err
+}
+
+func getAutoRestoreSession(db *sql.DB, groupName string) (autoRestoreSession, bool, error) {
+	row := db.QueryRow(`
+		SELECT group_name, original_proxy, current_proxy, last_triggered_at, last_triggered_host, last_triggered_bytes
+		FROM auto_restore_sessions
+		WHERE group_name = ?
+	`, groupName)
+
+	var session autoRestoreSession
+	if err := row.Scan(
+		&session.GroupName,
+		&session.OriginalProxy,
+		&session.CurrentProxy,
+		&session.LastTriggeredAt,
+		&session.LastTriggeredHost,
+		&session.LastTriggeredBytes,
+	); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return autoRestoreSession{}, false, nil
+		}
+		return autoRestoreSession{}, false, err
+	}
+
+	return session, true, nil
 }
 
 func listAutoSwitchEvents(db *sql.DB, limit int) ([]autoSwitchEvent, error) {
@@ -981,6 +1094,9 @@ func (s *service) processConnections(payload *connectionsResponse) error {
 			log.Printf("auto switch evaluation: %v", err)
 		}
 	}
+	if err := s.evaluateAutoRestore(nowMS); err != nil {
+		log.Printf("auto restore evaluation: %v", err)
+	}
 
 	if err := s.flushCompletedAggregateBuckets(nowMS); err != nil {
 		log.Printf("flush aggregate buffer: %v", err)
@@ -1015,7 +1131,7 @@ func (s *service) evaluateAutoSwitch(logs []trafficLog, nowMS int64) error {
 		return nil
 	}
 
-	results, execErr := s.executeAutoSwitch(settings)
+	results, execErr := s.executeAutoSwitch(settings, nowMS, triggerHost, triggerTotal)
 	event := autoSwitchEvent{
 		TriggeredAt: nowMS,
 		Host:        triggerHost,
@@ -1090,7 +1206,7 @@ func (s *service) isAutoSwitchSuppressed(bucketStart, nowMS, cooldownSeconds int
 	return false
 }
 
-func (s *service) executeAutoSwitch(settings autoSwitchSettings) ([]autoSwitchExecutionResult, error) {
+func (s *service) executeAutoSwitch(settings autoSwitchSettings, triggeredAt int64, triggerHost string, triggerTotal int64) ([]autoSwitchExecutionResult, error) {
 	mihomo := s.currentMihomoSettings()
 	groups, err := s.listControllableProxyGroups(mihomo)
 	if err != nil {
@@ -1119,6 +1235,11 @@ func (s *service) executeAutoSwitch(settings autoSwitchSettings) ([]autoSwitchEx
 			continue
 		}
 
+		session, hasSession, err := getAutoRestoreSession(s.db, target.GroupName)
+		if err != nil {
+			return results, err
+		}
+
 		if group.Now == target.TargetProxy {
 			results = append(results, autoSwitchExecutionResult{
 				GroupName:   target.GroupName,
@@ -1126,6 +1247,15 @@ func (s *service) executeAutoSwitch(settings autoSwitchSettings) ([]autoSwitchEx
 				Status:      "skipped",
 				Message:     "already selected",
 			})
+			if settings.RestoreEnabled && settings.RestoreQuietMinutes > 0 && hasSession {
+				session.CurrentProxy = target.TargetProxy
+				session.LastTriggeredAt = triggeredAt
+				session.LastTriggeredHost = triggerHost
+				session.LastTriggeredBytes = triggerTotal
+				if err := upsertAutoRestoreSession(s.db, session); err != nil {
+					return results, err
+				}
+			}
 			continue
 		}
 
@@ -1144,9 +1274,163 @@ func (s *service) executeAutoSwitch(settings autoSwitchSettings) ([]autoSwitchEx
 			TargetProxy: target.TargetProxy,
 			Status:      "switched",
 		})
+
+		if settings.RestoreEnabled && settings.RestoreQuietMinutes > 0 {
+			originalProxy := group.Now
+			if hasSession && strings.TrimSpace(session.OriginalProxy) != "" {
+				originalProxy = session.OriginalProxy
+			}
+			if err := upsertAutoRestoreSession(s.db, autoRestoreSession{
+				GroupName:          target.GroupName,
+				OriginalProxy:      originalProxy,
+				CurrentProxy:       target.TargetProxy,
+				LastTriggeredAt:    triggeredAt,
+				LastTriggeredHost:  triggerHost,
+				LastTriggeredBytes: triggerTotal,
+			}); err != nil {
+				return results, err
+			}
+		}
 	}
 
 	return results, nil
+}
+
+func autoRestoreEligible(nowMS, lastTriggeredAt, quietMinutes int64) bool {
+	if lastTriggeredAt <= 0 || quietMinutes <= 0 {
+		return false
+	}
+
+	currentBucketStart := (nowMS / 60000) * 60000
+	triggerBucketStart := (lastTriggeredAt / 60000) * 60000
+	return currentBucketStart >= triggerBucketStart+quietMinutes*60000
+}
+
+func (s *service) evaluateAutoRestore(nowMS int64) error {
+	settings, err := loadAutoSwitchSettings(s.db)
+	if err != nil {
+		return err
+	}
+	if !settings.RestoreEnabled || settings.RestoreQuietMinutes <= 0 {
+		return nil
+	}
+
+	sessions, err := listAutoRestoreSessions(s.db)
+	if err != nil {
+		return err
+	}
+	if len(sessions) == 0 {
+		return nil
+	}
+
+	pending := make([]autoRestoreSession, 0, len(sessions))
+	for _, session := range sessions {
+		if autoRestoreEligible(nowMS, session.LastTriggeredAt, settings.RestoreQuietMinutes) {
+			pending = append(pending, session)
+		}
+	}
+	if len(pending) == 0 {
+		return nil
+	}
+
+	mihomo := s.currentMihomoSettings()
+	groups, err := s.listControllableProxyGroups(mihomo)
+	if err != nil {
+		return err
+	}
+
+	groupByName := make(map[string]controllableProxyGroup, len(groups))
+	for _, group := range groups {
+		groupByName[group.Name] = group
+	}
+
+	results := make([]autoSwitchExecutionResult, 0, len(pending))
+	var eventErrs []string
+	for _, session := range pending {
+		group, ok := groupByName[session.GroupName]
+		if !ok {
+			results = append(results, autoSwitchExecutionResult{
+				GroupName:   session.GroupName,
+				TargetProxy: session.OriginalProxy,
+				Status:      "restore_error",
+				Message:     "group not found",
+			})
+			eventErrs = append(eventErrs, fmt.Sprintf("%s: group not found", session.GroupName))
+			if err := deleteAutoRestoreSession(s.db, session.GroupName); err != nil {
+				return err
+			}
+			continue
+		}
+
+		if group.Now != session.CurrentProxy {
+			results = append(results, autoSwitchExecutionResult{
+				GroupName:   session.GroupName,
+				TargetProxy: session.OriginalProxy,
+				Status:      "restore_skipped",
+				Message:     "selection changed manually",
+			})
+			if err := deleteAutoRestoreSession(s.db, session.GroupName); err != nil {
+				return err
+			}
+			continue
+		}
+
+		if !containsString(group.All, session.OriginalProxy) {
+			results = append(results, autoSwitchExecutionResult{
+				GroupName:   session.GroupName,
+				TargetProxy: session.OriginalProxy,
+				Status:      "restore_error",
+				Message:     "original proxy is no longer available",
+			})
+			eventErrs = append(eventErrs, fmt.Sprintf("%s: original proxy unavailable", session.GroupName))
+			if err := deleteAutoRestoreSession(s.db, session.GroupName); err != nil {
+				return err
+			}
+			continue
+		}
+
+		if err := s.switchProxyGroup(mihomo, group, session.OriginalProxy); err != nil {
+			results = append(results, autoSwitchExecutionResult{
+				GroupName:   session.GroupName,
+				TargetProxy: session.OriginalProxy,
+				Status:      "restore_error",
+				Message:     err.Error(),
+			})
+			eventErrs = append(eventErrs, fmt.Sprintf("%s: %v", session.GroupName, err))
+			if err := deleteAutoRestoreSession(s.db, session.GroupName); err != nil {
+				return err
+			}
+			continue
+		}
+
+		results = append(results, autoSwitchExecutionResult{
+			GroupName:   session.GroupName,
+			TargetProxy: session.OriginalProxy,
+			Status:      "restored",
+		})
+		if err := deleteAutoRestoreSession(s.db, session.GroupName); err != nil {
+			return err
+		}
+	}
+
+	if len(results) == 0 {
+		return nil
+	}
+
+	bucketStart := (nowMS / 60000) * 60000
+	event := autoSwitchEvent{
+		TriggeredAt: nowMS,
+		Host:        "",
+		TotalBytes:  0,
+		WindowStart: bucketStart,
+		WindowEnd:   bucketStart + 60000,
+		Results:     results,
+	}
+	if len(eventErrs) > 0 {
+		event.Error = strings.Join(eventErrs, "; ")
+	}
+
+	return insertAutoSwitchEvent(s.db, event)
 }
 
 func (s *service) insertLogs(logs []trafficLog) error {
@@ -1422,6 +1706,9 @@ func validateAutoSwitchSettings(settings autoSwitchSettings) error {
 	}
 	if settings.CooldownSeconds < 0 {
 		return errors.New("cooldownSeconds must be 0 or greater")
+	}
+	if settings.RestoreQuietMinutes < 0 {
+		return errors.New("restoreQuietMinutes must be 0 or greater")
 	}
 
 	for _, target := range settings.GroupTargets {

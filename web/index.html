@@ -152,6 +152,10 @@
                 <span>启用自动切换</span>
                 <input id="autoSwitchEnabled" type="checkbox" />
               </label>
+              <label class="settings-field checkbox-field">
+                <span>自动恢复原节点</span>
+                <input id="autoRestoreEnabled" type="checkbox" />
+              </label>
               <label class="settings-field">
                 <span>1 分钟阈值（MB）</span>
                 <input id="autoSwitchThreshold" type="number" min="1" step="1" placeholder="例如 512" />
@@ -159,6 +163,10 @@
               <label class="settings-field">
                 <span>冷却时间（分钟）</span>
                 <input id="autoSwitchCooldown" type="number" min="0" step="1" placeholder="例如 10" />
+              </label>
+              <label class="settings-field">
+                <span>静默恢复时间（分钟）</span>
+                <input id="autoRestoreQuietMinutes" type="number" min="0" step="1" placeholder="例如 15" />
               </label>
             </div>
 

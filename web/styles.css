@@ -459,7 +459,7 @@ select {
 
 .auto-switch-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
   gap: 12px;
   margin-bottom: 14px;
 }
@@ -552,7 +552,7 @@ select {
 .auto-switch-result {
   padding: 8px 10px;
   border-radius: 12px;
-  background: rgba(95, 70, 255, 0.06);
+  background: rgba(31, 111, 235, 0.08);
   color: var(--muted-strong);
   font-size: 13px;
 }
