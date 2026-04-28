@@ -1707,6 +1707,9 @@ func validateAutoSwitchSettings(settings autoSwitchSettings) error {
 	if settings.CooldownSeconds < 0 {
 		return errors.New("cooldownSeconds must be 0 or greater")
 	}
+	if settings.RestoreQuietMinutes < 0 {
+		return errors.New("restoreQuietMinutes must be 0 or greater")
+	}
 
 	for _, target := range settings.GroupTargets {
 		if strings.TrimSpace(target.GroupName) == "" {

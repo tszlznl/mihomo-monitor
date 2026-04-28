@@ -1710,6 +1710,8 @@ func TestHandleAutoSwitchSettingsRoundTrip(t *testing.T) {
 		"enabled": true,
 		"thresholdBytesPerMinute": 536870912,
 		"cooldownSeconds": 900,
+		"restoreEnabled": true,
+		"restoreQuietMinutes": 15,
 		"groupTargets": [
 			{"groupName":"🌍 国外媒体","targetProxy":"🇸🇬 Singapore","enabled":true}
 		]
@@ -1730,6 +1732,9 @@ func TestHandleAutoSwitchSettingsRoundTrip(t *testing.T) {
 	if !updated.Enabled || updated.ThresholdBytesPerMinute != 536870912 || updated.CooldownSeconds != 900 {
 		t.Fatalf("unexpected saved settings: %+v", updated)
 	}
+	if !updated.RestoreEnabled || updated.RestoreQuietMinutes != 15 {
+		t.Fatalf("unexpected saved restore settings: %+v", updated)
+	}
 	if len(updated.GroupTargets) != 1 || updated.GroupTargets[0].GroupName != "🌍 国外媒体" {
 		t.Fatalf("unexpected saved group targets: %+v", updated.GroupTargets)
 	}
@@ -1749,6 +1754,9 @@ func TestHandleAutoSwitchSettingsRoundTrip(t *testing.T) {
 	if fetched.Enabled != updated.Enabled || fetched.ThresholdBytesPerMinute != updated.ThresholdBytesPerMinute {
 		t.Fatalf("unexpected fetched settings: %+v want %+v", fetched, updated)
 	}
+	if fetched.RestoreEnabled != updated.RestoreEnabled || fetched.RestoreQuietMinutes != updated.RestoreQuietMinutes {
+		t.Fatalf("unexpected fetched restore settings: %+v want %+v", fetched, updated)
+	}
 }
 
 func TestHandleAutoSwitchSettingsRejectsInvalidThreshold(t *testing.T) {
@@ -1767,6 +1775,27 @@ func TestHandleAutoSwitchSettingsRejectsInvalidThreshold(t *testing.T) {
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected bad request for invalid threshold, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleAutoSwitchSettingsRejectsNegativeRestoreQuietMinutes(t *testing.T) {
+	svc := newTestService(t)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/auto-switch/settings", bytes.NewBufferString(`{
+		"enabled": true,
+		"thresholdBytesPerMinute": 300,
+		"cooldownSeconds": 60,
+		"restoreEnabled": true,
+		"restoreQuietMinutes": -1,
+		"groupTargets": [{"groupName":"🌍 国外媒体","targetProxy":"🇸🇬 Singapore","enabled":true}]
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	svc.routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected bad request for negative restore quiet minutes, got %d body=%s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -1836,6 +1865,47 @@ func TestHandleAutoSwitchEventsReturnsRecentEvents(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].Host != "video.example" {
 		t.Fatalf("unexpected events payload: %+v", got)
+	}
+}
+
+func TestHandleAutoSwitchEventsReturnsRestoreStatuses(t *testing.T) {
+	svc := newTestService(t)
+
+	if err := insertAutoSwitchEvent(svc.db, autoSwitchEvent{
+		TriggeredAt: 5678,
+		Host:        "",
+		TotalBytes:  0,
+		WindowStart: 120_000,
+		WindowEnd:   180_000,
+		Results: []autoSwitchExecutionResult{
+			{GroupName: "🌍 国外媒体", TargetProxy: "🚩 PROXY", Status: "restored"},
+			{GroupName: "🐟 漏网之鱼", TargetProxy: "DIRECT", Status: "restore_error", Message: "original proxy is no longer available"},
+		},
+		Error: "🐟 漏网之鱼: original proxy unavailable",
+	}); err != nil {
+		t.Fatalf("insertAutoSwitchEvent: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/auto-switch/events", nil)
+	rec := httptest.NewRecorder()
+	svc.routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	var got []autoSwitchEvent
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected one event payload, got %d", len(got))
+	}
+	if len(got[0].Results) != 2 {
+		t.Fatalf("expected restore results to round-trip, got %+v", got[0].Results)
+	}
+	if got[0].Results[0].Status != "restored" || got[0].Results[1].Status != "restore_error" {
+		t.Fatalf("expected restore statuses in payload, got %+v", got[0].Results)
 	}
 }
 
