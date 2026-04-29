@@ -2008,7 +2008,8 @@ func (s *service) handleAggregate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	data, err := s.queryAggregate(dimension, start, end)
+	raw := r.URL.Query().Get("raw") == "1"
+	data, err := s.queryAggregate(dimension, start, end, raw)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -2214,7 +2215,7 @@ func (s *service) handleLogs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
-func (s *service) queryAggregate(dimension string, start, end int64) ([]aggregatedData, error) {
+func (s *service) queryAggregate(dimension string, start, end int64, raw bool) ([]aggregatedData, error) {
 	column, err := dimensionColumn(dimension)
 	if err != nil {
 		return nil, err
@@ -2223,7 +2224,7 @@ func (s *service) queryAggregate(dimension string, start, end int64) ([]aggregat
 	if err != nil {
 		return nil, err
 	}
-	if column == "host" && s.currentDomainGroupingEnabled() {
+	if column == "host" && !raw && s.currentDomainGroupingEnabled() {
 		rows = groupHostRows(rows)
 	}
 	return rows, nil
