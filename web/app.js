@@ -354,12 +354,17 @@ function buildAutoSwitchSummary() {
 
 function updateViewHints() {
   const config = drilldownConfig[elements.dimension.value] || drilldownConfig.sourceIP
-  const secondaryTitle = config.buildSecondaryTitle(state.selectedPrimary)
+  const groupedHostMode = elements.dimension.value === "host" && state.domainGroupingEnabled
+
+  const secondaryColumn = groupedHostMode ? "子域名" : config.secondaryColumn
+  const secondaryTitle = groupedHostMode
+    ? (state.selectedPrimary ? `${state.selectedPrimary} 的子域名` : "子域名")
+    : config.buildSecondaryTitle(state.selectedPrimary)
   const detailTitle = config.buildDetailTitle(state.selectedPrimary, state.selectedSecondary)
 
   elements.countLabel.textContent = config.countLabel
   elements.primaryTitle.textContent = config.primaryTitle
-  elements.secondaryHeader.textContent = config.secondaryColumn
+  elements.secondaryHeader.textContent = secondaryColumn
   elements.secondaryTitle.textContent = secondaryTitle
   elements.secondaryTitle.title = secondaryTitle
   elements.detailTitle.textContent = detailTitle
@@ -1045,16 +1050,22 @@ async function loadSecondaryRows(primaryLabel) {
 
   let path = "/api/traffic/substats"
   let params
+  let subdomainMode = false
   if (dimension === "host") {
-    path = "/api/traffic/devices-by-host"
-    params = { host: primaryLabel, start, end }
+    if (state.domainGroupingEnabled) {
+      subdomainMode = true
+      params = { dimension: "host", label: primaryLabel, start, end }
+    } else {
+      path = "/api/traffic/devices-by-host"
+      params = { host: primaryLabel, start, end }
+    }
   } else {
     params = { dimension, label: primaryLabel, start, end }
   }
 
   const rows = await fetchJSON(path, params)
   state.secondaryRows = rows
-  state.selectedSecondary = rows[0]?.label || null
+  state.selectedSecondary = subdomainMode ? null : (rows[0]?.label || null)
   renderSecondaryTable(rows)
   updateViewHints()
 

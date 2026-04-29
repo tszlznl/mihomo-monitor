@@ -3353,3 +3353,104 @@ func TestQueryAggregateHostGrouping(t *testing.T) {
 		}
 	})
 }
+
+func TestQuerySubstatsHostGrouping(t *testing.T) {
+	t.Run("returns raw subdomains for normalized host when grouping enabled", func(t *testing.T) {
+		svc := newTestService(t)
+		insertTestAggregates(t, svc.db, []aggregatedEntry{
+			{BucketStart: 0, BucketEnd: 60_000, SourceIP: "192.168.1.2", Host: "r1---sn-abc.googlevideo.com", Outbound: "NodeA", Chains: `["NodeA"]`, Upload: 100, Download: 200, Count: 1},
+			{BucketStart: 0, BucketEnd: 60_000, SourceIP: "192.168.1.2", Host: "r4---sn-xyz.googlevideo.com", Outbound: "NodeA", Chains: `["NodeA"]`, Upload: 50, Download: 80, Count: 2},
+			{BucketStart: 0, BucketEnd: 60_000, SourceIP: "192.168.1.2", Host: "www.youtube.com", Outbound: "NodeA", Chains: `["NodeA"]`, Upload: 10, Download: 20, Count: 1},
+		})
+
+		rows, err := svc.querySubstats("host", "googlevideo.com", 0, 60_000)
+		if err != nil {
+			t.Fatalf("querySubstats: %v", err)
+		}
+		if len(rows) != 2 {
+			t.Errorf("expected 2 subdomain rows, got %d: %v", len(rows), rows)
+		}
+		byLabel := make(map[string]aggregatedData)
+		for _, r := range rows {
+			byLabel[r.Label] = r
+		}
+		if _, ok := byLabel["r1---sn-abc.googlevideo.com"]; !ok {
+			t.Error("expected r1---sn-abc.googlevideo.com in results")
+		}
+		if _, ok := byLabel["r4---sn-xyz.googlevideo.com"]; !ok {
+			t.Error("expected r4---sn-xyz.googlevideo.com in results")
+		}
+		if _, ok := byLabel["www.youtube.com"]; ok {
+			t.Error("www.youtube.com should not appear in googlevideo.com substats")
+		}
+	})
+
+	t.Run("returns error when grouping disabled", func(t *testing.T) {
+		svc := newTestService(t)
+		if err := svc.updateDomainGroupingEnabled(false); err != nil {
+			t.Fatalf("updateDomainGroupingEnabled: %v", err)
+		}
+		_, err := svc.querySubstats("host", "googlevideo.com", 0, 60_000)
+		if err == nil {
+			t.Fatal("expected error for host substats when grouping disabled")
+		}
+	})
+
+	t.Run("exact match passes through for bare IP label", func(t *testing.T) {
+		svc := newTestService(t)
+		insertTestAggregates(t, svc.db, []aggregatedEntry{
+			{BucketStart: 0, BucketEnd: 60_000, SourceIP: "192.168.1.2", Host: "192.0.2.1", Outbound: "NodeA", Chains: `["NodeA"]`, Upload: 100, Download: 200, Count: 1},
+			{BucketStart: 0, BucketEnd: 60_000, SourceIP: "192.168.1.2", Host: "example.com", Outbound: "NodeA", Chains: `["NodeA"]`, Upload: 10, Download: 20, Count: 1},
+		})
+
+		rows, err := svc.querySubstats("host", "192.0.2.1", 0, 60_000)
+		if err != nil {
+			t.Fatalf("querySubstats: %v", err)
+		}
+		if len(rows) != 1 {
+			t.Errorf("expected 1 row for bare IP, got %d: %v", len(rows), rows)
+		}
+		if rows[0].Label != "192.0.2.1" {
+			t.Errorf("expected label 192.0.2.1, got %s", rows[0].Label)
+		}
+	})
+}
+
+func TestConnectionDetailsSubdomainSecondary(t *testing.T) {
+	svc := newTestService(t)
+	insertTestAggregates(t, svc.db, []aggregatedEntry{
+		{BucketStart: 0, BucketEnd: 60_000, SourceIP: "192.168.1.2", Host: "r1---sn-abc.googlevideo.com", Outbound: "NodeA", Chains: `["NodeA"]`, Upload: 100, Download: 200, Count: 1},
+		{BucketStart: 0, BucketEnd: 60_000, SourceIP: "192.168.1.3", Host: "r1---sn-abc.googlevideo.com", Outbound: "NodeA", Chains: `["NodeA"]`, Upload: 50, Download: 80, Count: 1},
+		{BucketStart: 0, BucketEnd: 60_000, SourceIP: "192.168.1.2", Host: "r4---sn-xyz.googlevideo.com", Outbound: "NodeA", Chains: `["NodeA"]`, Upload: 10, Download: 20, Count: 1},
+	})
+
+	// secondary is a raw subdomain — should return all source IPs for that host
+	details, err := svc.queryConnectionDetails("host", "googlevideo.com", "r1---sn-abc.googlevideo.com", 0, 60_000)
+	if err != nil {
+		t.Fatalf("queryConnectionDetails: %v", err)
+	}
+	if len(details) != 2 {
+		t.Errorf("expected 2 detail rows (one per source IP), got %d: %v", len(details), details)
+	}
+	sourceIPs := make(map[string]bool)
+	for _, d := range details {
+		sourceIPs[d.SourceIP] = true
+	}
+	if !sourceIPs["192.168.1.2"] || !sourceIPs["192.168.1.3"] {
+		t.Errorf("expected both source IPs, got %v", sourceIPs)
+	}
+
+	// secondary is a source IP — existing behaviour unchanged
+	details, err = svc.queryConnectionDetails("host", "googlevideo.com", "192.168.1.2", 0, 60_000)
+	if err != nil {
+		t.Fatalf("queryConnectionDetails (IP secondary): %v", err)
+	}
+	if len(details) == 0 {
+		t.Error("expected results for source IP secondary")
+	}
+	for _, d := range details {
+		if d.SourceIP != "192.168.1.2" {
+			t.Errorf("expected only source IP 192.168.1.2, got %s", d.SourceIP)
+		}
+	}
+}

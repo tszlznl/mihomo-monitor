@@ -2087,7 +2087,8 @@ func (s *service) handleDevicesByHost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	data, err := s.queryByFilters("source_ip", "host = ?", []any{host}, start, end)
+	hostFilter, hostArgs := s.hostFilterArgs(host)
+	data, err := s.queryByFilters("source_ip", hostFilter, hostArgs, start, end)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -2247,13 +2248,26 @@ func groupHostRows(rows []aggregatedData) []aggregatedData {
 	return sortedAggregatedDataRows(merged)
 }
 
+// hostFilterArgs returns a SQL filter and args for matching a host column.
+// When domain grouping is enabled, expands a normalized host to also match subdomains via LIKE.
+func (s *service) hostFilterArgs(host string) (string, []any) {
+	if s.currentDomainGroupingEnabled() {
+		return "(host = ? OR host LIKE ?)", []any{host, "%." + host}
+	}
+	return "host = ?", []any{host}
+}
+
 func (s *service) querySubstats(dimension, label string, start, end int64) ([]aggregatedData, error) {
 	column, err := dimensionColumn(dimension)
 	if err != nil {
 		return nil, err
 	}
 	if column == "host" {
-		return nil, errors.New("host is not supported for substats")
+		if !s.currentDomainGroupingEnabled() {
+			return nil, errors.New("host substats require domain grouping to be enabled")
+		}
+		hostFilter, hostArgs := s.hostFilterArgs(label)
+		return s.queryByFilters("host", hostFilter, hostArgs, start, end)
 	}
 	return s.queryByFilters("host", column+" = ?", []any{label}, start, end)
 }
@@ -2287,6 +2301,17 @@ func (s *service) queryConnectionDetails(dimension, primary, secondary string, s
 	filter, args, err := detailFilter(dimension, primary, secondary)
 	if err != nil {
 		return nil, err
+	}
+	if dimension == "host" && s.currentDomainGroupingEnabled() {
+		if net.ParseIP(secondary) == nil {
+			// secondary is a raw subdomain — show all source IPs for that host
+			filter = "host = ?"
+			args = []any{secondary}
+		} else {
+			hostFilter, hostArgs := s.hostFilterArgs(primary)
+			filter = hostFilter + " AND source_ip = ?"
+			args = append(hostArgs, secondary)
+		}
 	}
 
 	rows, err := s.db.Query(`
@@ -2564,22 +2589,55 @@ func matchesAggregateEntryFilters(entry aggregatedEntry, filter string, args []a
 	}
 
 	clauses := strings.Split(filter, " AND ")
-	if len(clauses) != len(args) {
-		return false
-	}
-
-	for i, clause := range clauses {
+	argIdx := 0
+	for _, clause := range clauses {
+		clause = strings.TrimSpace(clause)
+		if argIdx >= len(args) {
+			return false
+		}
+		// Handle compound clause: (col = ? OR col LIKE ?)
+		// Used for normalized-host LIKE expansion. Consumes 2 args.
+		if strings.HasPrefix(clause, "(") && strings.HasSuffix(clause, ")") {
+			if argIdx+1 >= len(args) {
+				return false
+			}
+			inner := clause[1 : len(clause)-1]
+			parts := strings.SplitN(inner, " OR ", 2)
+			if len(parts) != 2 {
+				return false
+			}
+			col := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(parts[0]), "= ?"))
+			col = strings.TrimSpace(strings.TrimSuffix(col, " = ?"))
+			fieldVal := aggregateEntryFieldValue(entry, col)
+			exactVal := fmt.Sprint(args[argIdx])
+			likePattern := fmt.Sprint(args[argIdx+1])
+			if fieldVal != exactVal && !matchesLikePattern(fieldVal, likePattern) {
+				return false
+			}
+			argIdx += 2
+			continue
+		}
+		// Handle simple clause: col = ?
 		column := strings.TrimSpace(strings.TrimSuffix(clause, "= ?"))
 		column = strings.TrimSpace(strings.TrimSuffix(column, " = ?"))
 		if column == "" {
 			return false
 		}
-		if aggregateEntryFieldValue(entry, column) != fmt.Sprint(args[i]) {
+		if aggregateEntryFieldValue(entry, column) != fmt.Sprint(args[argIdx]) {
 			return false
 		}
+		argIdx++
 	}
 
-	return true
+	return argIdx == len(args)
+}
+
+// matchesLikePattern matches the "%.suffix" pattern (prefix wildcard only).
+func matchesLikePattern(value, pattern string) bool {
+	if strings.HasPrefix(pattern, "%.") {
+		return strings.HasSuffix(value, pattern[1:])
+	}
+	return value == pattern
 }
 
 func aggregateEntryFieldValue(entry aggregatedEntry, column string) string {
