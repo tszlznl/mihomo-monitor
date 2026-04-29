@@ -3048,11 +3048,12 @@ func newTestService(t *testing.T) *service {
 	})
 
 	return &service{
-		db:                db,
-		now:               time.Now,
-		lastConnections:   make(map[string]connection),
-		aggregateBuffer:   make(map[string]*aggregatedEntry),
-		hostMinuteWindows: make(map[string]*hostTrafficWindow),
+		db:                    db,
+		now:                   time.Now,
+		domainGroupingEnabled: loadDomainGroupingEnabled(db),
+		lastConnections:       make(map[string]connection),
+		aggregateBuffer:       make(map[string]*aggregatedEntry),
+		hostMinuteWindows:     make(map[string]*hostTrafficWindow),
 	}
 }
 
@@ -3114,6 +3115,108 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return fn(req)
+}
+
+func TestDomainGroupingEnabled(t *testing.T) {
+	svc := newTestService(t)
+
+	// Default: no row in DB → returns true
+	if got := loadDomainGroupingEnabled(svc.db); !got {
+		t.Fatal("expected default to be true")
+	}
+
+	// Save false, reload
+	if err := saveDomainGroupingEnabled(svc.db, false); err != nil {
+		t.Fatalf("saveDomainGroupingEnabled(false): %v", err)
+	}
+	if got := loadDomainGroupingEnabled(svc.db); got {
+		t.Fatal("expected false after saving false")
+	}
+
+	// Save true, reload
+	if err := saveDomainGroupingEnabled(svc.db, true); err != nil {
+		t.Fatalf("saveDomainGroupingEnabled(true): %v", err)
+	}
+	if got := loadDomainGroupingEnabled(svc.db); !got {
+		t.Fatal("expected true after saving true")
+	}
+}
+
+func TestHandleDomainGroupingSettings(t *testing.T) {
+	svc := newTestService(t)
+
+	t.Run("GET returns default true", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/settings/domain-grouping", nil)
+		rec := httptest.NewRecorder()
+		svc.routes().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET status %d: %s", rec.Code, rec.Body.String())
+		}
+		var resp map[string]interface{}
+		if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if resp["enabled"] != true {
+			t.Fatalf("expected enabled=true, got %v", resp["enabled"])
+		}
+	})
+
+	t.Run("PUT sets false", func(t *testing.T) {
+		body := bytes.NewBufferString(`{"enabled":false}`)
+		req := httptest.NewRequest(http.MethodPut, "/api/settings/domain-grouping", body)
+		rec := httptest.NewRecorder()
+		svc.routes().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("PUT status %d: %s", rec.Code, rec.Body.String())
+		}
+		var resp map[string]interface{}
+		if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if resp["enabled"] != false {
+			t.Fatalf("expected enabled=false, got %v", resp["enabled"])
+		}
+		if svc.currentDomainGroupingEnabled() {
+			t.Fatal("expected in-memory state to be false")
+		}
+	})
+
+	t.Run("PUT sets true", func(t *testing.T) {
+		body := bytes.NewBufferString(`{"enabled":true}`)
+		req := httptest.NewRequest(http.MethodPut, "/api/settings/domain-grouping", body)
+		rec := httptest.NewRecorder()
+		svc.routes().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("PUT status %d: %s", rec.Code, rec.Body.String())
+		}
+		if !svc.currentDomainGroupingEnabled() {
+			t.Fatal("expected in-memory state to be true")
+		}
+	})
+
+	t.Run("PUT bad JSON returns 400", func(t *testing.T) {
+		body := bytes.NewBufferString(`not-json`)
+		req := httptest.NewRequest(http.MethodPut, "/api/settings/domain-grouping", body)
+		rec := httptest.NewRecorder()
+		svc.routes().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400, got %d", rec.Code)
+		}
+	})
+
+	t.Run("DELETE returns 405", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodDelete, "/api/settings/domain-grouping", nil)
+		rec := httptest.NewRecorder()
+		svc.routes().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("expected 405, got %d", rec.Code)
+		}
+	})
 }
 
 func TestNormalizeHost(t *testing.T) {

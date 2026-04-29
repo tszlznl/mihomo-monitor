@@ -169,21 +169,22 @@ type mihomoProxiesResponse struct {
 }
 
 type service struct {
-	db                *sql.DB
-	client            *http.Client
-	now               func() time.Time
-	cfg               config
-	mu                sync.Mutex
-	mihomoSettings    mihomoSettings
-	lastConnections   map[string]connection
-	lastUploadTotal   int64
-	lastDownloadTotal int64
-	lastAutoSwitchAt  int64
-	lastAutoSwitchMin int64
-	lastCleanup       time.Time
-	lastVacuum        time.Time
-	aggregateBuffer   map[string]*aggregatedEntry
-	hostMinuteWindows map[string]*hostTrafficWindow
+	db                    *sql.DB
+	client                *http.Client
+	now                   func() time.Time
+	cfg                   config
+	mu                    sync.Mutex
+	mihomoSettings        mihomoSettings
+	domainGroupingEnabled bool
+	lastConnections       map[string]connection
+	lastUploadTotal       int64
+	lastDownloadTotal     int64
+	lastAutoSwitchAt      int64
+	lastAutoSwitchMin     int64
+	lastCleanup           time.Time
+	lastVacuum            time.Time
+	aggregateBuffer       map[string]*aggregatedEntry
+	hostMinuteWindows     map[string]*hostTrafficWindow
 }
 
 type aggregatedEntry struct {
@@ -223,16 +224,19 @@ func main() {
 		log.Fatalf("resolve mihomo settings: %v", err)
 	}
 
+	domainGroupingEnabled := loadDomainGroupingEnabled(db)
+
 	svc := &service{
-		db:                db,
-		client:            &http.Client{Timeout: 10 * time.Second},
-		now:               time.Now,
-		cfg:               cfg,
-		mihomoSettings:    runtimeSettings,
-		lastConnections:   make(map[string]connection),
-		lastVacuum:        time.Now(),
-		aggregateBuffer:   make(map[string]*aggregatedEntry),
-		hostMinuteWindows: make(map[string]*hostTrafficWindow),
+		db:                    db,
+		client:                &http.Client{Timeout: 10 * time.Second},
+		now:                   time.Now,
+		cfg:                   cfg,
+		mihomoSettings:        runtimeSettings,
+		domainGroupingEnabled: domainGroupingEnabled,
+		lastConnections:       make(map[string]connection),
+		lastVacuum:            time.Now(),
+		aggregateBuffer:       make(map[string]*aggregatedEntry),
+		hostMinuteWindows:     make(map[string]*hostTrafficWindow),
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -467,6 +471,28 @@ func saveMihomoSettings(db *sql.DB, settings mihomoSettings) error {
 	}
 
 	return tx.Commit()
+}
+
+func loadDomainGroupingEnabled(db *sql.DB) bool {
+	var value string
+	err := db.QueryRow(`SELECT value FROM app_settings WHERE key = 'domain_grouping_enabled'`).Scan(&value)
+	if err != nil {
+		return true // default on
+	}
+	return value == "true"
+}
+
+func saveDomainGroupingEnabled(db *sql.DB, enabled bool) error {
+	value := "false"
+	if enabled {
+		value = "true"
+	}
+	_, err := db.Exec(`
+		INSERT INTO app_settings (key, value)
+		VALUES ('domain_grouping_enabled', ?)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value
+	`, value)
+	return err
 }
 
 func resolveMihomoSettings(db *sql.DB, envURL, envSecret string) (mihomoSettings, error) {
@@ -979,6 +1005,22 @@ func (s *service) updateMihomoSettings(settings mihomoSettings) error {
 		return err
 	}
 	s.setMihomoSettings(settings)
+	return nil
+}
+
+func (s *service) currentDomainGroupingEnabled() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.domainGroupingEnabled
+}
+
+func (s *service) updateDomainGroupingEnabled(enabled bool) error {
+	if err := saveDomainGroupingEnabled(s.db, enabled); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.domainGroupingEnabled = enabled
+	s.mu.Unlock()
 	return nil
 }
 
@@ -1771,6 +1813,7 @@ func (s *service) routes() http.Handler {
 	mux.Handle("/", fileServer)
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/api/settings/mihomo", s.handleMihomoSettings)
+	mux.HandleFunc("/api/settings/domain-grouping", s.handleDomainGroupingSettings)
 	mux.HandleFunc("/api/auto-switch/settings", s.handleAutoSwitchSettings)
 	mux.HandleFunc("/api/auto-switch/groups", s.handleAutoSwitchGroups)
 	mux.HandleFunc("/api/auto-switch/events", s.handleAutoSwitchEvents)
@@ -1845,6 +1888,29 @@ func (s *service) handleMihomoSettings(w http.ResponseWriter, r *http.Request) {
 		}
 
 		writeJSON(w, http.StatusOK, s.currentMihomoSettings())
+	default:
+		writeMethodNotAllowed(w)
+	}
+}
+
+func (s *service) handleDomainGroupingSettings(w http.ResponseWriter, r *http.Request) {
+	type domainGroupingResponse struct {
+		Enabled bool `json:"enabled"`
+	}
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, domainGroupingResponse{Enabled: s.currentDomainGroupingEnabled()})
+	case http.MethodPut:
+		var payload domainGroupingResponse
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			writeError(w, http.StatusBadRequest, errors.New("invalid json body"))
+			return
+		}
+		if err := s.updateDomainGroupingEnabled(payload.Enabled); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, domainGroupingResponse{Enabled: s.currentDomainGroupingEnabled()})
 	default:
 		writeMethodNotAllowed(w)
 	}
