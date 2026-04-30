@@ -30,6 +30,12 @@ jobs:
             cc: aarch64-linux-gnu-gcc
             ext: ""
           - target: binary
+            goos: linux
+            goarch: arm64
+            cc: aarch64-linux-musl-gcc
+            ext: ""
+            musl: true
+          - target: binary
             goos: windows
             goarch: amd64
             cc: x86_64-w64-mingw32-gcc
@@ -92,10 +98,17 @@ jobs:
           cache-dependency-path: go.sum
 
       - name: Install cross-compilers
-        if: matrix.target == 'binary'
+        if: matrix.target == 'binary' && !matrix.musl
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu gcc-mingw-w64-x86-64
+
+      - name: Install musl cross-compiler
+        if: matrix.musl
+        run: |
+          curl -L https://musl.cc/aarch64-linux-musl-cross.tgz -o /tmp/musl-cross.tgz
+          sudo tar -xzf /tmp/musl-cross.tgz -C /usr/local
+          echo "/usr/local/aarch64-linux-musl-cross/bin" >> "$GITHUB_PATH"
 
       - name: Build binary
         if: matrix.target == 'binary'
@@ -107,7 +120,8 @@ jobs:
           CC: ${{ matrix.cc }}
         run: |
           VERSION=${{ steps.version.outputs.version }}
-          OUTPUT_NAME=traffic-monitor-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
+          MUSL_SUFFIX="${{ matrix.musl && '-musl' || '' }}"
+          OUTPUT_NAME=traffic-monitor-${{ matrix.goos }}-${{ matrix.goarch }}${MUSL_SUFFIX}${{ matrix.ext }}
           echo "Building $OUTPUT_NAME version $VERSION"
           go build -ldflags="-s -w" -o "./$OUTPUT_NAME" main.go
           chmod +x "./$OUTPUT_NAME" || true
