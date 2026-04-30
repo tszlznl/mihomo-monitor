@@ -503,6 +503,26 @@ function syncAutoSwitchForm() {
   renderAutoSwitchEvents()
 }
 
+function applyAutoSwitchDefaults() {
+  if (!elements.autoSwitchEnabled.checked) return
+
+  const currentThreshold = Number(elements.autoSwitchThreshold.value || 0)
+  if (currentThreshold <= 0 || currentThreshold === 500) {
+    elements.autoSwitchThreshold.value = "100"
+  }
+  if (Number(elements.autoSwitchCooldown.value || 0) <= 0) {
+    elements.autoSwitchCooldown.value = "10"
+  }
+}
+
+function applyAutoRestoreDefaults() {
+  if (!elements.autoRestoreEnabled.checked) return
+
+  if (Number(elements.autoRestoreQuietMinutes.value || 0) <= 0) {
+    elements.autoRestoreQuietMinutes.value = "5"
+  }
+}
+
 function formatAutoSwitchStatus(status) {
   return autoSwitchStatusLabels[status] || status || "--"
 }
@@ -1252,6 +1272,12 @@ elements.settingsCloseBtn.addEventListener("click", closeSettingsPanel)
 elements.settingsModal.addEventListener("click", handleModalClose)
 elements.autoSwitchBtn.addEventListener("click", openAutoSwitchPanel)
 elements.autoSwitchForm.addEventListener("submit", saveAutoSwitchSettings)
+elements.autoSwitchEnabled.addEventListener("change", () => {
+  applyAutoSwitchDefaults()
+})
+elements.autoRestoreEnabled.addEventListener("change", () => {
+  applyAutoRestoreDefaults()
+})
 elements.autoSwitchCancelBtn.addEventListener("click", closeAutoSwitchPanel)
 elements.autoSwitchCloseBtn.addEventListener("click", closeAutoSwitchPanel)
 elements.autoSwitchModal.addEventListener("click", handleModalClose)

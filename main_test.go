@@ -915,6 +915,103 @@ func TestAutoSwitchOnlySwitchesTriggeredEnabledGroup(t *testing.T) {
 	}
 }
 
+func TestAutoSwitchMatchesEnabledGroupWithinChains(t *testing.T) {
+	svc := newTestService(t)
+
+	if err := saveAutoSwitchSettings(svc.db, autoSwitchSettings{
+		Enabled:                 true,
+		ThresholdBytesPerMinute: 300,
+		CooldownSeconds:         0,
+		GroupTargets: []autoSwitchGroupTarget{
+			{GroupName: "🇺🇸 USA", TargetProxy: "z vps |美国 VPS-jbirgl3y", Enabled: true},
+		},
+	}); err != nil {
+		t.Fatalf("saveAutoSwitchSettings: %v", err)
+	}
+
+	svc.setMihomoSettings(mihomoSettings{URL: "http://127.0.0.1:9090"})
+	currentTime := time.Date(2026, 4, 30, 2, 49, 10, 0, time.Local)
+	svc.now = func() time.Time { return currentTime }
+
+	var switches []string
+	svc.client = &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			switch {
+			case req.Method == http.MethodGet && req.URL.Path == "/proxies":
+				body := `{"proxies":{
+					"🇺🇸 USA":{"type":"Selector","all":["z vps |美国 VPS-jbirgl3y","speedVPS |美国 VPS_Speed-nvji7ppb"],"now":"speedVPS |美国 VPS_Speed-nvji7ppb"}
+				}}`
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader(body)),
+					Header:     make(http.Header),
+				}, nil
+			case req.Method == http.MethodPut:
+				switches = append(switches, req.URL.Path)
+				return &http.Response{
+					StatusCode: http.StatusNoContent,
+					Body:       io.NopCloser(strings.NewReader("")),
+					Header:     make(http.Header),
+				}, nil
+			default:
+				t.Fatalf("unexpected request: %s %s", req.Method, req.URL.Path)
+				return nil, nil
+			}
+		}),
+	}
+
+	first := &connectionsResponse{
+		Connections: []connection{{
+			ID:       "conn-1",
+			Upload:   100,
+			Download: 100,
+			Chains:   []string{"speedVPS |美国 VPS_Speed-nvji7ppb", "🇺🇸 USA", "🤖 人工智能"},
+			Metadata: struct {
+				SourceIP      string "json:\"sourceIP\""
+				Host          string "json:\"host\""
+				DestinationIP string "json:\"destinationIP\""
+				Process       string "json:\"process\""
+			}{SourceIP: "192.168.1.2", Host: "edgedl.me.gvt1.com", DestinationIP: "34.104.35.123", Process: "chrome"},
+		}},
+	}
+	second := &connectionsResponse{
+		Connections: []connection{{
+			ID:       "conn-1",
+			Upload:   250,
+			Download: 150,
+			Chains:   []string{"speedVPS |美国 VPS_Speed-nvji7ppb", "🇺🇸 USA", "🤖 人工智能"},
+			Metadata: struct {
+				SourceIP      string "json:\"sourceIP\""
+				Host          string "json:\"host\""
+				DestinationIP string "json:\"destinationIP\""
+				Process       string "json:\"process\""
+			}{SourceIP: "192.168.1.2", Host: "edgedl.me.gvt1.com", DestinationIP: "34.104.35.123", Process: "chrome"},
+		}},
+	}
+
+	if err := svc.processConnections(first); err != nil {
+		t.Fatalf("processConnections first: %v", err)
+	}
+	if err := svc.processConnections(second); err != nil {
+		t.Fatalf("processConnections second: %v", err)
+	}
+
+	if len(switches) != 1 || switches[0] != "/proxies/🇺🇸 USA" {
+		t.Fatalf("expected switch for enabled group inside chains, got %v", switches)
+	}
+
+	events, err := listAutoSwitchEvents(svc.db, 10)
+	if err != nil {
+		t.Fatalf("listAutoSwitchEvents: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 auto switch event, got %d", len(events))
+	}
+	if len(events[0].Results) != 1 || events[0].Results[0].GroupName != "🇺🇸 USA" {
+		t.Fatalf("unexpected event results: %+v", events[0].Results)
+	}
+}
+
 func TestAutoSwitchIgnoresTrafficForGroupsNotEnabledInSettings(t *testing.T) {
 	svc := newTestService(t)
 
@@ -2933,6 +3030,14 @@ func TestEmbeddedAppScriptIncludesContextualDashboardLabels(t *testing.T) {
 		`elements.secondaryTitle.title =`,
 		`elements.detailTitle.textContent =`,
 		`elements.detailTitle.title =`,
+		"function applyAutoSwitchDefaults()",
+		"function applyAutoRestoreDefaults()",
+		"currentThreshold === 500",
+		`elements.autoSwitchThreshold.value = "100"`,
+		`elements.autoSwitchCooldown.value = "10"`,
+		`elements.autoRestoreQuietMinutes.value = "5"`,
+		`elements.autoSwitchEnabled.addEventListener("change", () => {`,
+		`elements.autoRestoreEnabled.addEventListener("change", () => {`,
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("expected embedded app.js to contain %q", want)
@@ -3490,5 +3595,20 @@ func TestConnectionDetailsSubdomainSecondary(t *testing.T) {
 		if d.SourceIP != "192.168.1.2" {
 			t.Errorf("expected only source IP 192.168.1.2, got %s", d.SourceIP)
 		}
+	}
+
+	insertTestAggregates(t, svc.db, []aggregatedEntry{
+		{BucketStart: 0, BucketEnd: 60_000, SourceIP: "192.168.1.9", Host: "64.233.170.91", DestinationIP: "64.233.170.91", Process: "chrome", Outbound: "NodeA", Chains: `["NodeA"]`, Upload: 300, Download: 700, Count: 1},
+	})
+
+	details, err = svc.queryConnectionDetails("host", "64.233.170.91", "64.233.170.91", 0, 60_000)
+	if err != nil {
+		t.Fatalf("queryConnectionDetails (grouped IP host): %v", err)
+	}
+	if len(details) != 1 {
+		t.Fatalf("expected 1 detail row for grouped IP host, got %d: %v", len(details), details)
+	}
+	if details[0].SourceIP != "192.168.1.9" || details[0].DestinationIP != "64.233.170.91" {
+		t.Fatalf("unexpected grouped IP host detail row: %+v", details[0])
 	}
 }

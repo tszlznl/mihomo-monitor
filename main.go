@@ -1262,6 +1262,16 @@ func enabledAutoSwitchTargets(settings autoSwitchSettings) map[string]autoSwitch
 	return targets
 }
 
+func firstMatchingAutoSwitchGroup(chains []string, enabledTargets map[string]autoSwitchGroupTarget) (autoSwitchGroupTarget, bool) {
+	for _, name := range chains {
+		target, ok := enabledTargets[strings.TrimSpace(name)]
+		if ok {
+			return target, true
+		}
+	}
+	return autoSwitchGroupTarget{}, false
+}
+
 func (s *service) updateHostMinuteWindows(
 	logs []trafficLog,
 	nowMS int64,
@@ -1287,7 +1297,7 @@ func (s *service) updateHostMinuteWindows(
 			continue
 		}
 
-		target, ok := enabledTargets[strings.TrimSpace(entry.Outbound)]
+		target, ok := firstMatchingAutoSwitchGroup(entry.Chains, enabledTargets)
 		if !ok {
 			continue
 		}
@@ -2372,7 +2382,10 @@ func (s *service) queryConnectionDetails(dimension, primary, secondary string, s
 		return nil, err
 	}
 	if dimension == "host" && s.currentDomainGroupingEnabled() {
-		if net.ParseIP(secondary) == nil {
+		if net.ParseIP(primary) != nil {
+			filter = "host = ?"
+			args = []any{secondary}
+		} else if net.ParseIP(secondary) == nil {
 			// secondary is a raw subdomain — show all source IPs for that host
 			filter = "host = ?"
 			args = []any{secondary}
