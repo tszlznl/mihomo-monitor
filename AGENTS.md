@@ -51,6 +51,12 @@ These instructions apply to the entire repository. If a deeper directory later g
 - Do not commit unrelated untracked files such as local notes, temporary docs, or `.claude/` contents unless the user explicitly asks for them.
 - Keep commits grouped by user-visible outcome, not by file type.
 
+## Release Versioning
+
+- Keep the release tag and the page footer version in sync.
+- When bumping a release, update the footer version string in `web/index.html`.
+- Use the same version string for the git tag, prefixed with `v`.
+
 ## Useful Commands
 
 ```bash
