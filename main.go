@@ -1220,7 +1220,12 @@ func (s *service) evaluateAutoSwitch(logs []trafficLog, nowMS int64) error {
 		return nil
 	}
 
-	if s.isAutoSwitchSuppressed(bucketStart, nowMS, settings.CooldownSeconds) {
+	log.Printf("auto switch debug: trigger reached host=%q group=%q total=%d threshold=%d bucket=%d-%d",
+		triggerHost, triggerGroup, triggerTotal, settings.ThresholdBytesPerMinute, bucketStart, bucketEnd)
+
+	if reason, suppressed := s.autoSwitchSuppressionReason(bucketStart, nowMS, settings.CooldownSeconds); suppressed {
+		log.Printf("auto switch debug: suppressed trigger host=%q group=%q reason=%s cooldown_seconds=%d",
+			triggerHost, triggerGroup, reason, settings.CooldownSeconds)
 		return nil
 	}
 
@@ -1323,16 +1328,21 @@ func (s *service) updateHostMinuteWindows(
 }
 
 func (s *service) isAutoSwitchSuppressed(bucketStart, nowMS, cooldownSeconds int64) bool {
+	_, suppressed := s.autoSwitchSuppressionReason(bucketStart, nowMS, cooldownSeconds)
+	return suppressed
+}
+
+func (s *service) autoSwitchSuppressionReason(bucketStart, nowMS, cooldownSeconds int64) (string, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if s.lastAutoSwitchMin == bucketStart {
-		return true
+		return "same_bucket", true
 	}
 	if cooldownSeconds > 0 && s.lastAutoSwitchAt > 0 && nowMS < s.lastAutoSwitchAt+cooldownSeconds*1000 {
-		return true
+		return "cooldown", true
 	}
-	return false
+	return "", false
 }
 
 func (s *service) executeAutoSwitch(
@@ -1410,6 +1420,8 @@ func (s *service) executeAutoSwitchChain(
 	}
 
 	if group.Now == target.TargetProxy {
+		log.Printf("auto switch debug: group=%q already selected target=%q host=%q total=%d",
+			target.GroupName, target.TargetProxy, triggerHost, triggerTotal)
 		results = append(results, autoSwitchExecutionResult{
 			GroupName:   target.GroupName,
 			TargetProxy: target.TargetProxy,
@@ -1440,6 +1452,8 @@ func (s *service) executeAutoSwitchChain(
 	}
 
 	if err := s.switchProxyGroup(mihomo, group, target.TargetProxy); err != nil {
+		log.Printf("auto switch debug: switch failed group=%q from=%q to=%q host=%q total=%d err=%v",
+			target.GroupName, group.Now, target.TargetProxy, triggerHost, triggerTotal, err)
 		results = append(results, autoSwitchExecutionResult{
 			GroupName:   target.GroupName,
 			TargetProxy: target.TargetProxy,
@@ -1449,6 +1463,8 @@ func (s *service) executeAutoSwitchChain(
 		return results, nil
 	}
 
+	log.Printf("auto switch debug: switched group=%q from=%q to=%q host=%q total=%d",
+		target.GroupName, group.Now, target.TargetProxy, triggerHost, triggerTotal)
 	results = append(results, autoSwitchExecutionResult{
 		GroupName:   target.GroupName,
 		TargetProxy: target.TargetProxy,
