@@ -209,30 +209,30 @@
           <div class="auto-switch-layout">
             <form id="autoSwitchForm" class="auto-switch-form">
               <div class="auto-switch-grid">
-                <label class="settings-field switch-field">
+                <label class="settings-field switch-field auto-switch-card auto-switch-toggle-card">
                   <span>启用自动切换</span>
                   <label class="switch">
                     <input id="autoSwitchEnabled" type="checkbox" />
                     <span class="switch-slider"></span>
                   </label>
                 </label>
-                <label class="settings-field switch-field">
+                <label class="settings-field switch-field auto-switch-card auto-switch-toggle-card">
                   <span>自动恢复原节点</span>
                   <label class="switch">
                     <input id="autoRestoreEnabled" type="checkbox" />
                     <span class="switch-slider"></span>
                   </label>
                 </label>
-                <label class="settings-field">
+                <label class="settings-field auto-switch-card auto-switch-metric-card">
                   <span>1 分钟阈值（MB）</span>
                   <input id="autoSwitchThreshold" type="number" min="1" step="1" placeholder="例如 512" />
                 </label>
-                <label class="settings-field">
+                <label class="settings-field auto-switch-card auto-switch-metric-card">
                   <span>冷却时间（分钟）</span>
                   <input id="autoSwitchCooldown" type="number" min="0" step="1" placeholder="例如 10" />
                 </label>
-                <label class="settings-field">
-                  <span>静默恢复时间（分钟）</span>
+                <label class="settings-field auto-switch-card auto-switch-metric-card">
+                  <span>恢复时间（分钟）</span>
                   <input id="autoRestoreQuietMinutes" type="number" min="0" step="1" placeholder="例如 15" />
                 </label>
               </div>

@@ -576,6 +576,7 @@ function renderAutoSwitchEvents() {
   }
 
   elements.autoSwitchEventsBody.innerHTML = state.autoSwitch.events
+    .slice(0, 50)
     .map((event) => {
       const isRestoreEvent = !event.host && Number(event.totalBytes || 0) === 0
       const results = (event.results || [])

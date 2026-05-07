@@ -2486,6 +2486,44 @@ func TestHandleAutoSwitchEventsReturnsRecentEvents(t *testing.T) {
 	}
 }
 
+func TestHandleAutoSwitchEventsLimitsToFifty(t *testing.T) {
+	svc := newTestService(t)
+
+	for i := 0; i < 55; i++ {
+		if err := insertAutoSwitchEvent(svc.db, autoSwitchEvent{
+			TriggeredAt: int64(1_000 + i),
+			Host:        fmt.Sprintf("video-%02d.example", i),
+			TotalBytes:  int64(1_000 + i),
+			WindowStart: int64(i) * 60_000,
+			WindowEnd:   int64(i+1) * 60_000,
+			Results: []autoSwitchExecutionResult{
+				{GroupName: "🌍 国外媒体", TargetProxy: "🇸🇬 Singapore", Status: "switched"},
+			},
+		}); err != nil {
+			t.Fatalf("insertAutoSwitchEvent %d: %v", i, err)
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/auto-switch/events", nil)
+	rec := httptest.NewRecorder()
+	svc.routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	var got []autoSwitchEvent
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(got) != 50 {
+		t.Fatalf("expected 50 events, got %d", len(got))
+	}
+	if got[0].Host != "video-54.example" || got[len(got)-1].Host != "video-05.example" {
+		t.Fatalf("unexpected event ordering: first=%q last=%q", got[0].Host, got[len(got)-1].Host)
+	}
+}
+
 func TestHandleAutoSwitchEventsReturnsRestoreStatuses(t *testing.T) {
 	svc := newTestService(t)
 

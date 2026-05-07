@@ -771,7 +771,7 @@ func getAutoRestoreSession(db *sql.DB, groupName string) (autoRestoreSession, bo
 
 func listAutoSwitchEvents(db *sql.DB, limit int) ([]autoSwitchEvent, error) {
 	if limit <= 0 {
-		limit = 20
+		limit = 50
 	}
 
 	rows, err := db.Query(`
@@ -2081,7 +2081,7 @@ func (s *service) handleAutoSwitchEvents(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	events, err := listAutoSwitchEvents(s.db, 20)
+	events, err := listAutoSwitchEvents(s.db, 50)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
