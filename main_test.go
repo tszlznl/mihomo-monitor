@@ -3308,9 +3308,27 @@ func TestEmbeddedSummaryModeMarkers(t *testing.T) {
 			t.Fatalf("expected embedded app.js to contain %q", want)
 		}
 	}
+	// Detail/summary mode switches rewrite the range select; the start/end
+	// pickers must be refreshed so they match the range actually queried.
+	syncRangeOptions := extractJSFunction(script, "syncRangeOptions")
+	if !strings.Contains(syncRangeOptions, "updateCustomInputs()") {
+		t.Fatalf("expected syncRangeOptions() to refresh custom time inputs after changing the range")
+	}
 	if !strings.Contains(styles, "body.summary-mode") {
 		t.Fatalf("expected embedded styles.css to include summary mode layout rules")
 	}
+}
+
+func extractJSFunction(script, name string) string {
+	start := strings.Index(script, "function "+name+"(")
+	if start < 0 {
+		return ""
+	}
+	next := strings.Index(script[start:], "\nfunction ")
+	if next < 0 {
+		return script[start:]
+	}
+	return script[start : start+next]
 }
 
 func TestEmbeddedTrendChartIncludesAxisAndTooltip(t *testing.T) {

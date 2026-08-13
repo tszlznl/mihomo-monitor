@@ -322,6 +322,7 @@ function syncRangeOptions() {
   } else if (summaryOption.selected) {
     elements.range.value = "604800000"
   }
+  updateCustomInputs()
 }
 
 function applyMode(mode) {
