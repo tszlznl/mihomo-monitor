@@ -4306,6 +4306,86 @@ func TestOpenDatabaseUpgradesLegacySchemaWithoutRuleGroup(t *testing.T) {
 	}
 }
 
+func TestOpenDatabaseDropsLegacyTrafficLogsPerColumnIndexes(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "legacy.db")
+
+	db, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	_, err = db.Exec(`
+		CREATE TABLE traffic_logs (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			timestamp INTEGER NOT NULL,
+			source_ip TEXT NOT NULL,
+			host TEXT NOT NULL,
+			destination_ip TEXT NOT NULL DEFAULT '',
+			process TEXT NOT NULL,
+			outbound TEXT NOT NULL,
+			chains TEXT NOT NULL DEFAULT '[]',
+			rule_group TEXT NOT NULL DEFAULT 'unknown',
+			upload INTEGER NOT NULL,
+			download INTEGER NOT NULL
+		);
+		CREATE INDEX idx_traffic_logs_timestamp ON traffic_logs(timestamp);
+		CREATE INDEX idx_traffic_logs_source_ip ON traffic_logs(source_ip);
+		CREATE INDEX idx_traffic_logs_host ON traffic_logs(host);
+		CREATE INDEX idx_traffic_logs_process ON traffic_logs(process);
+		CREATE INDEX idx_traffic_logs_outbound ON traffic_logs(outbound);
+		CREATE INDEX idx_traffic_logs_rule_group ON traffic_logs(rule_group);
+	`)
+	if err != nil {
+		db.Close()
+		t.Fatalf("create legacy schema: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close legacy db: %v", err)
+	}
+
+	opened, err := openDatabase(path)
+	if err != nil {
+		t.Fatalf("openDatabase on legacy db: %v", err)
+	}
+	defer opened.Close()
+
+	rows, err := opened.Query(`PRAGMA index_list(traffic_logs)`)
+	if err != nil {
+		t.Fatalf("index_list: %v", err)
+	}
+	defer rows.Close()
+
+	indexes := map[string]bool{}
+	for rows.Next() {
+		var (
+			seq     int
+			name    string
+			unique  int
+			origin  string
+			partial int
+		)
+		if err := rows.Scan(&seq, &name, &unique, &origin, &partial); err != nil {
+			t.Fatalf("scan index_list: %v", err)
+		}
+		indexes[name] = true
+	}
+
+	for _, dropped := range []string{
+		"idx_traffic_logs_source_ip",
+		"idx_traffic_logs_host",
+		"idx_traffic_logs_process",
+		"idx_traffic_logs_outbound",
+		"idx_traffic_logs_rule_group",
+	} {
+		if indexes[dropped] {
+			t.Errorf("expected legacy index %q to be dropped", dropped)
+		}
+	}
+	if !indexes["idx_traffic_logs_timestamp"] {
+		t.Errorf("expected idx_traffic_logs_timestamp to be kept")
+	}
+}
+
 func TestRuleDimensionHidesUnknownButShowsMatch(t *testing.T) {
 	svc := newTestService(t)
 	insertTestAggregates(t, svc.db, []aggregatedEntry{

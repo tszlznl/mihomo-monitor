@@ -35,7 +35,11 @@ const (
 	summaryBucketSize      = int64(24 * time.Hour / time.Millisecond)
 	summaryBuildInterval   = 10 * time.Minute
 	defaultRetentionDays   = 30
-	defaultAllowedOrigin   = "*"
+	// Keep the WAL file bounded between hourly TRUNCATE checkpoints; with high
+	// write volume (5s polls, per-connection deltas) the WAL can otherwise grow
+	// to hundreds of MB, which slows every read that must merge it.
+	walCheckpointInterval = 5 * time.Minute
+	defaultAllowedOrigin  = "*"
 )
 
 var isContainerRuntime = func() bool {
@@ -188,6 +192,7 @@ type service struct {
 	lastAutoSwitchMin      int64
 	lastCleanup            time.Time
 	lastVacuum             time.Time
+	lastCheckpoint         time.Time
 	lastSummaryBuild       time.Time
 	aggregateBuffer        map[string]*aggregatedEntry
 	hostMinuteWindows      map[string]*hostTrafficWindow
@@ -356,11 +361,9 @@ func openDatabase(path string) (*sql.DB, error) {
 		UNIQUE(bucket_start, bucket_end, source_ip, host, destination_ip, process, outbound, chains)
 	);
 
+	-- Only the timestamp index on traffic_logs is ever read (startup backfill);
+	-- the other per-column indexes only amplified write cost for a write-only table.
 	CREATE INDEX IF NOT EXISTS idx_traffic_logs_timestamp ON traffic_logs(timestamp);
-	CREATE INDEX IF NOT EXISTS idx_traffic_logs_source_ip ON traffic_logs(source_ip);
-	CREATE INDEX IF NOT EXISTS idx_traffic_logs_host ON traffic_logs(host);
-	CREATE INDEX IF NOT EXISTS idx_traffic_logs_process ON traffic_logs(process);
-	CREATE INDEX IF NOT EXISTS idx_traffic_logs_outbound ON traffic_logs(outbound);
 
 	CREATE INDEX IF NOT EXISTS idx_traffic_aggregated_bucket ON traffic_aggregated(bucket_start, bucket_end);
 	CREATE INDEX IF NOT EXISTS idx_traffic_aggregated_source_ip ON traffic_aggregated(source_ip);
@@ -440,10 +443,25 @@ func openDatabase(path string) (*sql.DB, error) {
 	// legacy databases do not have the column yet, and CREATE INDEX runs in the
 	// schema block would fail before the ALTER could add it.
 	for _, stmt := range []string{
-		`CREATE INDEX IF NOT EXISTS idx_traffic_logs_rule_group ON traffic_logs(rule_group)`,
 		`CREATE INDEX IF NOT EXISTS idx_traffic_aggregated_rule_group ON traffic_aggregated(rule_group)`,
 	} {
 		if _, err := db.Exec(stmt); err != nil {
+			db.Close()
+			return nil, err
+		}
+	}
+
+	// Drop legacy traffic_logs per-column indexes (source_ip/host/process/outbound/
+	// rule_group). traffic_logs is write-only in production — the page reads
+	// traffic_aggregated — so these indexes only amplified write amplification.
+	for _, idx := range []string{
+		"idx_traffic_logs_source_ip",
+		"idx_traffic_logs_host",
+		"idx_traffic_logs_process",
+		"idx_traffic_logs_outbound",
+		"idx_traffic_logs_rule_group",
+	} {
+		if _, err := db.Exec(`DROP INDEX IF EXISTS ` + idx); err != nil {
 			db.Close()
 			return nil, err
 		}
@@ -1368,6 +1386,14 @@ func (s *service) processConnections(payload *connectionsResponse) error {
 			log.Printf("cleanup old logs: %v", err)
 		} else {
 			s.lastCleanup = now
+		}
+	}
+
+	if now.Sub(s.lastCheckpoint) >= walCheckpointInterval {
+		if _, err := s.db.Exec(`PRAGMA wal_checkpoint(PASSIVE)`); err != nil {
+			log.Printf("wal checkpoint: %v", err)
+		} else {
+			s.lastCheckpoint = now
 		}
 	}
 
@@ -3016,13 +3042,22 @@ func (s *service) queryByFiltersFromBuffer(groupColumn, extraFilter string, extr
 }
 
 func (s *service) queryByFiltersFromTable(table, timeFilter string, timeArgs []any, groupColumn, extraFilter string, extraArgs []any, countExpr string) ([]aggregatedData, error) {
+	fromClause := table
+	// Unfiltered GROUP BY over traffic_aggregated: without a hint the planner
+	// picks a covering scan of the single-column dimension index, which touches
+	// every row and makes query time proportional to the whole table. Forcing the
+	// bucket index bounds the scan to the requested time range (e.g. ~35x faster
+	// for a 7-day view on a 1M+ row table).
+	if table == "traffic_aggregated" && extraFilter == "" {
+		fromClause += " INDEXED BY idx_traffic_aggregated_bucket"
+	}
 	base := `
 		SELECT ` + groupColumn + ` AS label,
 		       COALESCE(SUM(upload), 0) AS upload,
 		       COALESCE(SUM(download), 0) AS download,
 		       COALESCE(SUM(upload + download), 0) AS total,
 		       ` + countExpr + ` AS count
-		FROM ` + table + `
+		FROM ` + fromClause + `
 		WHERE ` + timeFilter
 
 	args := append([]any{}, timeArgs...)
