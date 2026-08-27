@@ -23,6 +23,14 @@ const drilldownConfig = {
     buildDetailTitle: (primary, secondary) =>
       primary && secondary ? `${primary} / ${secondary} 的连接明细` : "连接明细",
   },
+  rule: {
+    countLabel: "规则",
+    primaryTitle: "规则排行",
+    secondaryColumn: "目标主机",
+    buildSecondaryTitle: (primary) => (primary ? `${primary} 命中的目标主机` : "目标主机"),
+    buildDetailTitle: (primary, secondary) =>
+      primary && secondary ? `${primary} / ${secondary} 的连接明细` : "连接明细",
+  },
 }
 
 const DIMENSION_STORAGE_KEY = "traffic-monitor:selected-dimension"

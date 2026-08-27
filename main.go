@@ -111,6 +111,7 @@ type trafficLog struct {
 	Process       string   `json:"process"`
 	Outbound      string   `json:"outbound"`
 	Chains        []string `json:"chains"`
+	RuleGroup     string   `json:"-"`
 	Upload        int64    `json:"upload"`
 	Download      int64    `json:"download"`
 }
@@ -142,11 +143,13 @@ type connectionDetail struct {
 }
 
 type connection struct {
-	ID       string   `json:"id"`
-	Upload   int64    `json:"upload"`
-	Download int64    `json:"download"`
-	Chains   []string `json:"chains"`
-	Metadata struct {
+	ID          string   `json:"id"`
+	Upload      int64    `json:"upload"`
+	Download    int64    `json:"download"`
+	Chains      []string `json:"chains"`
+	Rule        string   `json:"rule"`
+	RulePayload string   `json:"rulePayload"`
+	Metadata    struct {
 		SourceIP      string `json:"sourceIP"`
 		Host          string `json:"host"`
 		DestinationIP string `json:"destinationIP"`
@@ -200,6 +203,7 @@ type aggregatedEntry struct {
 	Process       string
 	Outbound      string
 	Chains        string
+	RuleGroup     string
 	Upload        int64
 	Download      int64
 	Count         int64
@@ -330,6 +334,7 @@ func openDatabase(path string) (*sql.DB, error) {
 		process TEXT NOT NULL,
 		outbound TEXT NOT NULL,
 		chains TEXT NOT NULL DEFAULT '[]',
+		rule_group TEXT NOT NULL DEFAULT 'unknown',
 		upload INTEGER NOT NULL,
 		download INTEGER NOT NULL
 	);
@@ -344,6 +349,7 @@ func openDatabase(path string) (*sql.DB, error) {
 		process TEXT NOT NULL,
 		outbound TEXT NOT NULL,
 		chains TEXT NOT NULL DEFAULT '[]',
+		rule_group TEXT NOT NULL DEFAULT 'unknown',
 		upload INTEGER NOT NULL,
 		download INTEGER NOT NULL,
 		count INTEGER NOT NULL,
@@ -421,8 +427,49 @@ func openDatabase(path string) (*sql.DB, error) {
 	for _, stmt := range []string{
 		`ALTER TABLE traffic_logs ADD COLUMN destination_ip TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE traffic_logs ADD COLUMN chains TEXT NOT NULL DEFAULT '[]'`,
+		`ALTER TABLE traffic_logs ADD COLUMN rule_group TEXT NOT NULL DEFAULT 'unknown'`,
+		`ALTER TABLE traffic_aggregated ADD COLUMN rule_group TEXT NOT NULL DEFAULT 'unknown'`,
 	} {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+			db.Close()
+			return nil, err
+		}
+	}
+
+	// rule_group indexes must be created after the ALTER migrations above:
+	// legacy databases do not have the column yet, and CREATE INDEX runs in the
+	// schema block would fail before the ALTER could add it.
+	for _, stmt := range []string{
+		`CREATE INDEX IF NOT EXISTS idx_traffic_logs_rule_group ON traffic_logs(rule_group)`,
+		`CREATE INDEX IF NOT EXISTS idx_traffic_aggregated_rule_group ON traffic_aggregated(rule_group)`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			db.Close()
+			return nil, err
+		}
+	}
+
+	// One-time re-label (user_version 0 -> 1): rows persisted before rule
+	// capture got the "match" default. Re-label them to the hidden "unknown"
+	// sentinel so legacy data disappears from the 规则 view while a real
+	// catch-all MATCH rule (which is also labelled "match") stays visible.
+	var userVersion int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&userVersion); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if userVersion < 1 {
+		for _, stmt := range []string{
+			`UPDATE traffic_logs SET rule_group = '` + unknownRuleGroup + `' WHERE rule_group = 'match'`,
+			`UPDATE traffic_aggregated SET rule_group = '` + unknownRuleGroup + `' WHERE rule_group = 'match'`,
+			`UPDATE traffic_summary SET label = '` + unknownRuleGroup + `' WHERE dimension = 'rule' AND label = 'match'`,
+		} {
+			if _, err := db.Exec(stmt); err != nil {
+				db.Close()
+				return nil, err
+			}
+		}
+		if _, err := db.Exec(`PRAGMA user_version = 1`); err != nil {
 			db.Close()
 			return nil, err
 		}
@@ -972,7 +1019,7 @@ func backfillAggregatedLogs(db *sql.DB, beforeMS int64) error {
 
 	_, err := db.Exec(`
 		INSERT INTO traffic_aggregated
-		(bucket_start, bucket_end, source_ip, host, destination_ip, process, outbound, chains, upload, download, count)
+		(bucket_start, bucket_end, source_ip, host, destination_ip, process, outbound, chains, rule_group, upload, download, count)
 		SELECT ((timestamp / 60000) * 60000) AS bucket_start,
 		       ((timestamp / 60000) * 60000) + 60000 AS bucket_end,
 		       source_ip,
@@ -981,6 +1028,7 @@ func backfillAggregatedLogs(db *sql.DB, beforeMS int64) error {
 		       process,
 		       outbound,
 		       chains,
+		       rule_group,
 		       COALESCE(SUM(upload), 0) AS upload,
 		       COALESCE(SUM(download), 0) AS download,
 		       COUNT(*) AS count
@@ -1048,6 +1096,20 @@ func backfillSummary(db *sql.DB, beforeMS int64) error {
 
 		SELECT ((bucket_start / ?) * ?) AS bucket_start,
 		       ((bucket_start / ?) * ?) + ? AS bucket_end,
+		       'rule',
+		       rule_group,
+		       host,
+		       COALESCE(SUM(upload), 0) AS upload,
+		       COALESCE(SUM(download), 0) AS download,
+		       COALESCE(SUM(count), 0) AS count
+		FROM traffic_aggregated
+		WHERE bucket_start >= ? AND bucket_start < ?
+		GROUP BY ((bucket_start / ?) * ?), rule_group, host
+
+		UNION ALL
+
+		SELECT ((bucket_start / ?) * ?) AS bucket_start,
+		       ((bucket_start / ?) * ?) + ? AS bucket_end,
 		       'total',
 		       'total',
 		       '',
@@ -1064,6 +1126,10 @@ func backfillSummary(db *sql.DB, beforeMS int64) error {
 			download = excluded.download,
 			count = excluded.count
 	`, summaryBucketSize, summaryBucketSize, summaryBucketSize, summaryBucketSize, summaryBucketSize,
+		startMS, endExclusive, summaryBucketSize, summaryBucketSize,
+		summaryBucketSize, summaryBucketSize, summaryBucketSize, summaryBucketSize, summaryBucketSize,
+		startMS, endExclusive, summaryBucketSize, summaryBucketSize,
+		summaryBucketSize, summaryBucketSize, summaryBucketSize, summaryBucketSize, summaryBucketSize,
 		startMS, endExclusive, summaryBucketSize, summaryBucketSize,
 		summaryBucketSize, summaryBucketSize, summaryBucketSize, summaryBucketSize, summaryBucketSize,
 		startMS, endExclusive, summaryBucketSize, summaryBucketSize,
@@ -1258,6 +1324,7 @@ func (s *service) processConnections(payload *connectionsResponse) error {
 			Process:       defaultString(conn.Metadata.Process, "Unknown"),
 			Outbound:      outboundName(conn.Chains),
 			Chains:        sanitizeChains(conn.Chains),
+			RuleGroup:     ruleGroupLabel(conn.Rule, conn.RulePayload),
 			Upload:        uploadDelta,
 			Download:      downloadDelta,
 		})
@@ -1790,8 +1857,8 @@ func (s *service) insertLogs(logs []trafficLog) error {
 	}
 
 	stmt, err := tx.Prepare(`
-		INSERT INTO traffic_logs (timestamp, source_ip, host, destination_ip, process, outbound, chains, upload, download)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO traffic_logs (timestamp, source_ip, host, destination_ip, process, outbound, chains, rule_group, upload, download)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		tx.Rollback()
@@ -1814,6 +1881,7 @@ func (s *service) insertLogs(logs []trafficLog) error {
 			entry.Process,
 			entry.Outbound,
 			string(chainsJSON),
+			entry.RuleGroup,
 			entry.Upload,
 			entry.Download,
 		); err != nil {
@@ -1903,6 +1971,7 @@ func (s *service) addToAggregateBuffer(logs []trafficLog, nowMS int64) error {
 				Process:       log.Process,
 				Outbound:      log.Outbound,
 				Chains:        string(chainsJSON),
+				RuleGroup:     log.RuleGroup,
 				Upload:        log.Upload,
 				Download:      log.Download,
 				Count:         1,
@@ -1939,8 +2008,8 @@ func (s *service) flushAggregateEntries(shouldFlush func(*aggregatedEntry) bool)
 
 	stmt, err := tx.Prepare(`
 		INSERT INTO traffic_aggregated
-		(bucket_start, bucket_end, source_ip, host, destination_ip, process, outbound, chains, upload, download, count)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		(bucket_start, bucket_end, source_ip, host, destination_ip, process, outbound, chains, rule_group, upload, download, count)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(bucket_start, bucket_end, source_ip, host, destination_ip, process, outbound, chains)
 		DO UPDATE SET
 			upload = traffic_aggregated.upload + excluded.upload,
@@ -1956,7 +2025,7 @@ func (s *service) flushAggregateEntries(shouldFlush func(*aggregatedEntry) bool)
 	for _, entry := range buffer {
 		if _, err := stmt.Exec(
 			entry.BucketStart, entry.BucketEnd, entry.SourceIP, entry.Host, entry.DestinationIP,
-			entry.Process, entry.Outbound, entry.Chains, entry.Upload, entry.Download, entry.Count,
+			entry.Process, entry.Outbound, entry.Chains, entry.RuleGroup, entry.Upload, entry.Download, entry.Count,
 		); err != nil {
 			tx.Rollback()
 			return err
@@ -2476,7 +2545,23 @@ func (s *service) queryAggregate(dimension string, start, end int64, raw bool) (
 	if column == "host" && !raw && s.currentDomainGroupingEnabled() {
 		rows = groupHostRows(rows)
 	}
+	if column == "rule_group" {
+		rows = hideUnknownRuleGroup(rows)
+	}
 	return rows, nil
+}
+
+// hideUnknownRuleGroup drops rows whose matched rule was never recorded
+// (legacy data and connections without rule info) from the 规则 view. A real
+// catch-all MATCH rule is labelled "match" and is still shown.
+func hideUnknownRuleGroup(rows []aggregatedData) []aggregatedData {
+	out := make([]aggregatedData, 0, len(rows))
+	for _, row := range rows {
+		if row.Label != unknownRuleGroup {
+			out = append(out, row)
+		}
+	}
+	return out
 }
 
 func groupHostRows(rows []aggregatedData) []aggregatedData {
@@ -2559,6 +2644,9 @@ func (s *service) querySummaryAggregate(dimension string, start, end int64, raw 
 	}
 	if column == "host" && !raw && s.currentDomainGroupingEnabled() {
 		data = groupHostRows(data)
+	}
+	if column == "rule_group" {
+		data = hideUnknownRuleGroup(data)
 	}
 	return data, nil
 }
@@ -2658,6 +2746,13 @@ func (s *service) querySummarySecondary(dimension, primary string, start, end in
 		args = []any{primary}
 		bufferGroupColumn = "host"
 		bufferFilter = "outbound = ?"
+	case "rule":
+		summaryDimension = "rule"
+		labelColumn = "secondary_label"
+		filter = " AND label = ?"
+		args = []any{primary}
+		bufferGroupColumn = "host"
+		bufferFilter = "rule_group = ?"
 	default:
 		return nil, fmt.Errorf("unsupported dimension %q", dimension)
 	}
@@ -2693,6 +2788,8 @@ func summaryDimensionParts(dimension string) (string, string, error) {
 		return "source_ip", "secondary_label", nil
 	case "outbound":
 		return "outbound", "label", nil
+	case "rule":
+		return "rule", "label", nil
 	default:
 		return "", "", fmt.Errorf("unsupported dimension %q", dimension)
 	}
@@ -3134,6 +3231,8 @@ func aggregateEntryFieldValue(entry aggregatedEntry, column string) string {
 		return entry.Outbound
 	case "chains":
 		return entry.Chains
+	case "rule_group":
+		return entry.RuleGroup
 	default:
 		return ""
 	}
@@ -3275,6 +3374,8 @@ func dimensionColumn(dimension string) (string, error) {
 		return "process", nil
 	case "outbound":
 		return "outbound", nil
+	case "rule":
+		return "rule_group", nil
 	default:
 		return "", fmt.Errorf("unsupported dimension %q", dimension)
 	}
@@ -3290,9 +3391,32 @@ func detailFilter(dimension, primary, secondary string) (string, []any, error) {
 		return "outbound = ? AND host = ?", []any{primary, secondary}, nil
 	case "process":
 		return "process = ? AND host = ?", []any{primary, secondary}, nil
+	case "rule":
+		return "rule_group = ? AND host = ?", []any{primary, secondary}, nil
 	default:
 		return "", nil, fmt.Errorf("unsupported dimension %q", dimension)
 	}
+}
+
+// unknownRuleGroup marks traffic whose matched rule was not recorded (legacy
+// rows and connections without rule info). It is hidden from the 规则 view,
+// unlike a real catch-all MATCH rule which is labelled "match" and shown.
+const unknownRuleGroup = "unknown"
+
+// ruleGroupLabel derives a display group from the Clash rule that matched a
+// connection. Rule type and payload come straight from Mihomo's /connections
+// (e.g. rule="GeoSite", rulePayload="telegram"), so a bare IP like
+// 91.108.56.108 can be surfaced as "geosite:telegram" instead of an opaque IP.
+func ruleGroupLabel(rule, rulePayload string) string {
+	rule = strings.ToLower(strings.TrimSpace(rule))
+	rulePayload = strings.TrimSpace(rulePayload)
+	if rule == "" {
+		return unknownRuleGroup
+	}
+	if rulePayload == "" {
+		return rule
+	}
+	return rule + ":" + rulePayload
 }
 
 func outboundName(chains []string) string {

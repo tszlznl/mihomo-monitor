@@ -682,8 +682,8 @@ func TestBackfillSummaryBuildsDailySummaryRows(t *testing.T) {
 	if err := svc.db.QueryRow(`SELECT COUNT(*) FROM traffic_summary`).Scan(&rowCount); err != nil {
 		t.Fatalf("count traffic_summary: %v", err)
 	}
-	if rowCount != 6 {
-		t.Fatalf("expected 2 days x source/outbound/total summary rows, got %d", rowCount)
+	if rowCount != 8 {
+		t.Fatalf("expected 2 days x source/outbound/rule/total summary rows, got %d", rowCount)
 	}
 }
 
@@ -3573,9 +3573,14 @@ func insertTestLogs(t *testing.T, db *sql.DB, logs []trafficLog) {
 			t.Fatalf("marshal chains: %v", err)
 		}
 
+		ruleGroup := entry.RuleGroup
+		if ruleGroup == "" {
+			ruleGroup = unknownRuleGroup
+		}
+
 		_, err = db.Exec(
-			`INSERT INTO traffic_logs (timestamp, source_ip, host, destination_ip, process, outbound, chains, upload, download)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			`INSERT INTO traffic_logs (timestamp, source_ip, host, destination_ip, process, outbound, chains, rule_group, upload, download)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			entry.Timestamp,
 			entry.SourceIP,
 			entry.Host,
@@ -3583,6 +3588,7 @@ func insertTestLogs(t *testing.T, db *sql.DB, logs []trafficLog) {
 			entry.Process,
 			entry.Outbound,
 			string(chainsRaw),
+			ruleGroup,
 			entry.Upload,
 			entry.Download,
 		)
@@ -3596,10 +3602,15 @@ func insertTestAggregates(t *testing.T, db *sql.DB, entries []aggregatedEntry) {
 	t.Helper()
 
 	for _, entry := range entries {
+		ruleGroup := entry.RuleGroup
+		if ruleGroup == "" {
+			ruleGroup = unknownRuleGroup
+		}
+
 		_, err := db.Exec(
 			`INSERT INTO traffic_aggregated
-			 (bucket_start, bucket_end, source_ip, host, destination_ip, process, outbound, chains, upload, download, count)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			 (bucket_start, bucket_end, source_ip, host, destination_ip, process, outbound, chains, rule_group, upload, download, count)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			entry.BucketStart,
 			entry.BucketEnd,
 			entry.SourceIP,
@@ -3608,6 +3619,7 @@ func insertTestAggregates(t *testing.T, db *sql.DB, entries []aggregatedEntry) {
 			entry.Process,
 			entry.Outbound,
 			entry.Chains,
+			ruleGroup,
 			entry.Upload,
 			entry.Download,
 			entry.Count,
@@ -4012,5 +4024,412 @@ func TestConnectionDetailsSubdomainSecondary(t *testing.T) {
 	}
 	if details[0].SourceIP != "192.168.1.9" || details[0].DestinationIP != "64.233.170.91" {
 		t.Fatalf("unexpected grouped IP host detail row: %+v", details[0])
+	}
+}
+
+func TestRuleGroupLabel(t *testing.T) {
+	cases := []struct {
+		name    string
+		rule    string
+		payload string
+		want    string
+	}{
+		{name: "empty rule", want: "unknown"},
+		{name: "real match rule shown", rule: "MATCH", payload: "", want: "match"},
+		{name: "match rule no payload", rule: "MATCH", want: "match"},
+		{name: "geosite", rule: "GeoSite", payload: "telegram", want: "geosite:telegram"},
+		{name: "geoip keeps payload case", rule: "GeoIP", payload: "CN", want: "geoip:CN"},
+		{name: "domain suffix", rule: "DOMAIN-SUFFIX", payload: "telegram.org", want: "domain-suffix:telegram.org"},
+		{name: "rule type only", rule: "MATCH", payload: " ", want: "match"},
+		{name: "whitespace trimmed", rule: "  GeoSite  ", payload: "  telegram  ", want: "geosite:telegram"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ruleGroupLabel(tc.rule, tc.payload); got != tc.want {
+				t.Fatalf("ruleGroupLabel(%q, %q) = %q, want %q", tc.rule, tc.payload, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestProcessConnectionsCapturesRuleGroup(t *testing.T) {
+	svc := newTestService(t)
+
+	payload := &connectionsResponse{
+		Connections: []connection{
+			{
+				ID:          "conn-tg",
+				Upload:      128,
+				Download:    256,
+				Chains:      []string{"ProxyA"},
+				Rule:        "GeoSite",
+				RulePayload: "telegram",
+				Metadata: struct {
+					SourceIP      string "json:\"sourceIP\""
+					Host          string "json:\"host\""
+					DestinationIP string "json:\"destinationIP\""
+					Process       string "json:\"process\""
+				}{
+					SourceIP:      "192.168.1.8",
+					Host:          "91.108.56.108",
+					DestinationIP: "91.108.56.108",
+					Process:       "Telegram",
+				},
+			},
+			{
+				ID:          "conn-ip",
+				Upload:      10,
+				Download:    20,
+				Chains:      []string{"DIRECT"},
+				Rule:        "GeoIP",
+				RulePayload: "CN",
+				Metadata: struct {
+					SourceIP      string "json:\"sourceIP\""
+					Host          string "json:\"host\""
+					DestinationIP string "json:\"destinationIP\""
+					Process       string "json:\"process\""
+				}{
+					SourceIP:      "192.168.1.8",
+					Host:          "223.5.5.5",
+					DestinationIP: "223.5.5.5",
+					Process:       "curl",
+				},
+			},
+			{
+				ID:       "conn-plain",
+				Upload:   5,
+				Download: 5,
+				Chains:   []string{"DIRECT"},
+				Metadata: struct {
+					SourceIP      string "json:\"sourceIP\""
+					Host          string "json:\"host\""
+					DestinationIP string "json:\"destinationIP\""
+					Process       string "json:\"process\""
+				}{
+					SourceIP: "192.168.1.8",
+					Host:     "localhost.localdomain",
+				},
+			},
+		},
+	}
+
+	if err := svc.processConnections(payload); err != nil {
+		t.Fatalf("processConnections: %v", err)
+	}
+
+	want := map[string]int64{
+		"geosite:telegram": 1,
+		"geoip:CN":         1,
+		unknownRuleGroup:   1,
+	}
+	got := make(map[string]int64)
+	for _, entry := range svc.aggregateBuffer {
+		got[entry.RuleGroup]++
+	}
+	if len(got) != len(want) {
+		t.Fatalf("expected rule groups %v, got %v", want, got)
+	}
+	for rule, count := range want {
+		if got[rule] != count {
+			t.Errorf("rule group %q: expected %d entries, got %d", rule, count, got[rule])
+		}
+	}
+}
+
+func TestQueryAggregateRuleDimension(t *testing.T) {
+	svc := newTestService(t)
+	insertTestAggregates(t, svc.db, []aggregatedEntry{
+		{BucketStart: 0, BucketEnd: 60_000, SourceIP: "192.168.1.2", Host: "91.108.56.108", DestinationIP: "91.108.56.108", Outbound: "NodeA", Chains: `["NodeA"]`, RuleGroup: "geosite:telegram", Upload: 100, Download: 200, Count: 1},
+		{BucketStart: 0, BucketEnd: 60_000, SourceIP: "192.168.1.2", Host: "t.me", Outbound: "NodeA", Chains: `["NodeA"]`, RuleGroup: "geosite:telegram", Upload: 50, Download: 80, Count: 2},
+		{BucketStart: 0, BucketEnd: 60_000, SourceIP: "192.168.1.2", Host: "223.5.5.5", Outbound: "DIRECT", Chains: `["DIRECT"]`, RuleGroup: "geoip:CN", Upload: 10, Download: 20, Count: 1},
+	})
+	svc.aggregateBuffer["pending"] = &aggregatedEntry{
+		BucketStart: 60_000, BucketEnd: 120_000, SourceIP: "192.168.1.2", Host: "example.com", Outbound: "NodeA", Chains: `["NodeA"]`, RuleGroup: "geosite:telegram", Upload: 7, Download: 9, Count: 1,
+	}
+
+	rows, err := svc.queryAggregate("rule", 0, 120_000, false)
+	if err != nil {
+		t.Fatalf("queryAggregate(rule): %v", err)
+	}
+
+	byLabel := make(map[string]aggregatedData)
+	for _, r := range rows {
+		byLabel[r.Label] = r
+	}
+
+	tg, ok := byLabel["geosite:telegram"]
+	if !ok {
+		t.Fatalf("expected geosite:telegram row, got %v", rows)
+	}
+	if tg.Upload != 157 || tg.Download != 289 || tg.Total != 446 || tg.Count != 4 {
+		t.Errorf("geosite:telegram unexpected totals: %+v", tg)
+	}
+
+	cn, ok := byLabel["geoip:CN"]
+	if !ok {
+		t.Fatalf("expected geoip:CN row, got %v", rows)
+	}
+	if cn.Upload != 10 || cn.Download != 20 {
+		t.Errorf("geoip:CN unexpected totals: %+v", cn)
+	}
+
+	if len(rows) != 2 {
+		t.Errorf("expected 2 rule rows, got %d: %v", len(rows), rows)
+	}
+
+	// Secondary drilldown: hosts matching one rule group.
+	hosts, err := svc.querySubstats("rule", "geosite:telegram", 0, 120_000)
+	if err != nil {
+		t.Fatalf("querySubstats(rule): %v", err)
+	}
+	hostLabels := make(map[string]bool)
+	for _, h := range hosts {
+		hostLabels[h.Label] = true
+	}
+	if !hostLabels["91.108.56.108"] || !hostLabels["t.me"] || !hostLabels["example.com"] {
+		t.Errorf("expected telegram hosts, got %v", hostLabels)
+	}
+
+	// Detail drilldown: one host under one rule group.
+	details, err := svc.queryConnectionDetails("rule", "geosite:telegram", "91.108.56.108", 0, 120_000)
+	if err != nil {
+		t.Fatalf("queryConnectionDetails(rule): %v", err)
+	}
+	if len(details) != 1 || details[0].DestinationIP != "91.108.56.108" {
+		t.Errorf("unexpected rule detail rows: %+v", details)
+	}
+}
+
+func TestQuerySummaryRuleDimension(t *testing.T) {
+	svc := newTestService(t)
+
+	day := int64(24 * time.Hour / time.Millisecond)
+	now := time.Date(2026, 8, 6, 15, 0, 0, 0, time.Local).UnixMilli()
+	dayStart := (now / day) * day
+	insertTestAggregates(t, svc.db, []aggregatedEntry{
+		{
+			BucketStart: dayStart - day,
+			BucketEnd:   dayStart - day + 60000,
+			SourceIP:    "192.168.1.8",
+			Host:        "91.108.56.108",
+			Outbound:    "ProxyA",
+			Chains:      `["ProxyA"]`,
+			RuleGroup:   "geosite:telegram",
+			Upload:      15,
+			Download:    25,
+			Count:       1,
+		},
+	})
+	if err := backfillSummary(svc.db, now); err != nil {
+		t.Fatalf("backfillSummary: %v", err)
+	}
+
+	start := dayStart - day
+	end := dayStart - 1
+
+	rows, err := svc.querySummaryAggregate("rule", start, end, false)
+	if err != nil {
+		t.Fatalf("querySummaryAggregate(rule): %v", err)
+	}
+	if len(rows) != 1 || rows[0].Label != "geosite:telegram" || rows[0].Upload != 15 || rows[0].Download != 25 {
+		t.Fatalf("unexpected rule summary: %+v", rows)
+	}
+
+	hosts, err := svc.querySummarySecondary("rule", "geosite:telegram", start, end)
+	if err != nil {
+		t.Fatalf("querySummarySecondary(rule): %v", err)
+	}
+	if len(hosts) != 1 || hosts[0].Label != "91.108.56.108" {
+		t.Fatalf("unexpected rule secondary summary: %+v", hosts)
+	}
+}
+
+func TestOpenDatabaseUpgradesLegacySchemaWithoutRuleGroup(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "legacy.db")
+
+	db, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	_, err = db.Exec(`
+		CREATE TABLE traffic_logs (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			timestamp INTEGER NOT NULL,
+			source_ip TEXT NOT NULL,
+			host TEXT NOT NULL,
+			destination_ip TEXT NOT NULL DEFAULT '',
+			process TEXT NOT NULL,
+			outbound TEXT NOT NULL,
+			chains TEXT NOT NULL DEFAULT '[]',
+			upload INTEGER NOT NULL,
+			download INTEGER NOT NULL
+		);
+		CREATE TABLE traffic_aggregated (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			bucket_start INTEGER NOT NULL,
+			bucket_end INTEGER NOT NULL,
+			source_ip TEXT NOT NULL,
+			host TEXT NOT NULL,
+			destination_ip TEXT NOT NULL DEFAULT '',
+			process TEXT NOT NULL,
+			outbound TEXT NOT NULL,
+			chains TEXT NOT NULL DEFAULT '[]',
+			upload INTEGER NOT NULL,
+			download INTEGER NOT NULL,
+			count INTEGER NOT NULL,
+			UNIQUE(bucket_start, bucket_end, source_ip, host, destination_ip, process, outbound, chains)
+		);
+	`)
+	if err != nil {
+		db.Close()
+		t.Fatalf("create legacy schema: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close legacy db: %v", err)
+	}
+
+	opened, err := openDatabase(path)
+	if err != nil {
+		t.Fatalf("openDatabase on legacy db: %v", err)
+	}
+	defer opened.Close()
+
+	for _, table := range []string{"traffic_logs", "traffic_aggregated"} {
+		var count int
+		if err := opened.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('` + table + `') WHERE name = 'rule_group'`).Scan(&count); err != nil {
+			t.Fatalf("check rule_group in %s: %v", table, err)
+		}
+		if count != 1 {
+			t.Errorf("expected rule_group column in %s after upgrade, got %d", table, count)
+		}
+	}
+}
+
+func TestRuleDimensionHidesUnknownButShowsMatch(t *testing.T) {
+	svc := newTestService(t)
+	insertTestAggregates(t, svc.db, []aggregatedEntry{
+		{BucketStart: 0, BucketEnd: 60_000, SourceIP: "192.168.1.2", Host: "91.108.56.108", Outbound: "NodeA", Chains: `["NodeA"]`, RuleGroup: "geosite:telegram", Upload: 100, Download: 200, Count: 1},
+		{BucketStart: 0, BucketEnd: 60_000, SourceIP: "192.168.1.2", Host: "catchall.example.com", Outbound: "NodeB", Chains: `["NodeB"]`, RuleGroup: "match", Upload: 50, Download: 60, Count: 1},
+		{BucketStart: 0, BucketEnd: 60_000, SourceIP: "192.168.1.2", Host: "old.example.com", Outbound: "DIRECT", Chains: `["DIRECT"]`, RuleGroup: "unknown", Upload: 500, Download: 700, Count: 1},
+	})
+
+	// Detail mode: legacy "unknown" is hidden; real catch-all "match" stays.
+	rows, err := svc.queryAggregate("rule", 0, 60_000, false)
+	if err != nil {
+		t.Fatalf("queryAggregate(rule): %v", err)
+	}
+	byLabel := make(map[string]aggregatedData)
+	for _, r := range rows {
+		byLabel[r.Label] = r
+	}
+	if len(rows) != 2 {
+		t.Fatalf("expected geosite:telegram + match, got %+v", rows)
+	}
+	if _, ok := byLabel[unknownRuleGroup]; ok {
+		t.Fatalf("legacy unknown group should be hidden, got %+v", rows)
+	}
+	if m, ok := byLabel["match"]; !ok || m.Upload != 50 {
+		t.Fatalf("real match group should be shown, got %+v", rows)
+	}
+
+	// Summary mode: same behavior after backfill.
+	day := int64(24 * time.Hour / time.Millisecond)
+	now := time.Date(2026, 8, 6, 15, 0, 0, 0, time.Local).UnixMilli()
+	dayStart := (now / day) * day
+	insertTestAggregates(t, svc.db, []aggregatedEntry{
+		{BucketStart: dayStart - day, BucketEnd: dayStart - day + 60000, SourceIP: "192.168.1.2", Host: "new.example.com", Outbound: "NodeA", Chains: `["NodeA"]`, RuleGroup: "geoip:CN", Upload: 10, Download: 20, Count: 1},
+		{BucketStart: dayStart - day, BucketEnd: dayStart - day + 60000, SourceIP: "192.168.1.2", Host: "catchall2.example.com", Outbound: "NodeB", Chains: `["NodeB"]`, RuleGroup: "match", Upload: 7, Download: 8, Count: 1},
+		{BucketStart: dayStart - day, BucketEnd: dayStart - day + 60000, SourceIP: "192.168.1.2", Host: "old2.example.com", Outbound: "DIRECT", Chains: `["DIRECT"]`, RuleGroup: "unknown", Upload: 99, Download: 99, Count: 1},
+	})
+	if err := backfillSummary(svc.db, now); err != nil {
+		t.Fatalf("backfillSummary: %v", err)
+	}
+	summaryRows, err := svc.querySummaryAggregate("rule", dayStart-day, dayStart-1, false)
+	if err != nil {
+		t.Fatalf("querySummaryAggregate(rule): %v", err)
+	}
+	summaryByLabel := make(map[string]aggregatedData)
+	for _, r := range summaryRows {
+		summaryByLabel[r.Label] = r
+	}
+	if len(summaryRows) != 2 {
+		t.Fatalf("expected geoip:CN + match in summary, got %+v", summaryRows)
+	}
+	if _, ok := summaryByLabel[unknownRuleGroup]; ok {
+		t.Fatalf("legacy unknown group should be hidden in summary, got %+v", summaryRows)
+	}
+	if m, ok := summaryByLabel["match"]; !ok || m.Upload != 7 {
+		t.Fatalf("real match group should be shown in summary, got %+v", summaryRows)
+	}
+}
+
+func TestLegacyMatchRowsRelabeledOnce(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "upgrade.db")
+
+	// Simulate a database already migrated by the first rule_group build:
+	// openDatabase creates the full schema, then we force user_version back to
+	// 0 and insert rows labelled "match" (the old default for legacy data).
+	opened, err := openDatabase(path)
+	if err != nil {
+		t.Fatalf("openDatabase: %v", err)
+	}
+	if _, err := opened.Exec(`PRAGMA user_version = 0`); err != nil {
+		opened.Close()
+		t.Fatalf("reset user_version: %v", err)
+	}
+	if _, err := opened.Exec(`
+		INSERT INTO traffic_aggregated (bucket_start, bucket_end, source_ip, host, destination_ip, process, outbound, chains, rule_group, upload, download, count)
+		VALUES (0, 60000, '192.168.1.2', 'old.example.com', '', 'curl', 'DIRECT', '["DIRECT"]', 'match', 10, 20, 1);
+		INSERT INTO traffic_logs (timestamp, source_ip, host, destination_ip, process, outbound, chains, rule_group, upload, download)
+		VALUES (1000, '192.168.1.2', 'old.example.com', '', 'curl', 'DIRECT', '["DIRECT"]', 'match', 10, 20);
+		INSERT INTO traffic_summary (bucket_start, bucket_end, dimension, label, secondary_label, upload, download, count)
+		VALUES (0, 60000, 'rule', 'match', 'old.example.com', 10, 20, 1);
+	`); err != nil {
+		opened.Close()
+		t.Fatalf("insert legacy match rows: %v", err)
+	}
+	if err := opened.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	// Reopen: the one-time re-label should convert legacy "match" rows to
+	// "unknown" (hidden) and bump user_version so a real MATCH rule is never
+	// relabelled on subsequent starts.
+	reopened, err := openDatabase(path)
+	if err != nil {
+		t.Fatalf("reopenDatabase: %v", err)
+	}
+	defer reopened.Close()
+
+	var version int
+	if err := reopened.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		t.Fatalf("read user_version: %v", err)
+	}
+	if version != 1 {
+		t.Fatalf("expected user_version 1 after migration, got %d", version)
+	}
+
+	for _, stmt := range []string{
+		`SELECT COUNT(*) FROM traffic_aggregated WHERE rule_group = 'match'`,
+		`SELECT COUNT(*) FROM traffic_logs WHERE rule_group = 'match'`,
+		`SELECT COUNT(*) FROM traffic_summary WHERE dimension = 'rule' AND label = 'match'`,
+	} {
+		var count int
+		if err := reopened.QueryRow(stmt).Scan(&count); err != nil {
+			t.Fatalf("count match rows: %v", err)
+		}
+		if count != 0 {
+			t.Errorf("expected no 'match' rows left, got %d for %q", count, stmt)
+		}
+	}
+
+	var unknown int
+	if err := reopened.QueryRow(`SELECT COUNT(*) FROM traffic_aggregated WHERE rule_group = 'unknown'`).Scan(&unknown); err != nil {
+		t.Fatalf("count unknown rows: %v", err)
+	}
+	if unknown != 1 {
+		t.Errorf("expected 1 unknown aggregate row after relabel, got %d", unknown)
 	}
 }
