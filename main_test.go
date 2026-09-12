@@ -902,6 +902,92 @@ func TestProcessConnectionsBuffersAggregatesWithoutPersistingRawLogs(t *testing.
 	}
 }
 
+func TestProcessConnectionsSkipsDirectTrafficWhenFilterEnabled(t *testing.T) {
+	svc := newTestService(t)
+	svc.filterDirectTraffic = true
+
+	payload := &connectionsResponse{
+		Connections: []connection{
+			testConnection("conn-direct", []string{"DIRECT"}, 9000, 9000),
+			testConnection("conn-proxy", []string{"ProxyA", "RelayB"}, 128, 256),
+		},
+	}
+
+	if err := svc.processConnections(payload); err != nil {
+		t.Fatalf("processConnections: %v", err)
+	}
+
+	if len(svc.aggregateBuffer) != 1 {
+		t.Fatalf("expected only the proxied connection to be buffered, got %d entries", len(svc.aggregateBuffer))
+	}
+	for _, entry := range svc.aggregateBuffer {
+		if entry.Outbound != "ProxyA" {
+			t.Fatalf("unexpected buffered outbound: %+v", entry)
+		}
+		if entry.Upload != 128 || entry.Download != 256 {
+			t.Fatalf("unexpected buffered totals: %+v", entry)
+		}
+	}
+}
+
+func TestFilterDirectTrafficSettingDefaultsOffAndSurvivesRestart(t *testing.T) {
+	svc := newTestService(t)
+
+	if svc.currentFilterDirectTraffic() {
+		t.Fatal("expected direct traffic filter to default to off")
+	}
+
+	if err := saveFilterDirectTraffic(svc.db, true); err != nil {
+		t.Fatalf("saveFilterDirectTraffic: %v", err)
+	}
+	if !loadFilterDirectTraffic(svc.db) {
+		t.Fatal("expected persisted filter flag to load as true")
+	}
+
+	restarted := newTestServiceOnDB(svc.db)
+	if !restarted.currentFilterDirectTraffic() {
+		t.Fatal("expected restarted service to pick up the persisted filter flag")
+	}
+}
+
+func TestDirectTrafficFilterKeepsBaselineSoReplayDoesNotSpike(t *testing.T) {
+	svc := newTestService(t)
+
+	if err := svc.updateFilterDirectTraffic(true); err != nil {
+		t.Fatalf("updateFilterDirectTraffic(true): %v", err)
+	}
+
+	first := &connectionsResponse{
+		Connections: []connection{testConnection("conn-1", []string{"DIRECT"}, 100, 100)},
+	}
+	if err := svc.processConnections(first); err != nil {
+		t.Fatalf("processConnections first: %v", err)
+	}
+	if len(svc.aggregateBuffer) != 0 {
+		t.Fatalf("expected direct traffic to be dropped, got %d buffer entries", len(svc.aggregateBuffer))
+	}
+
+	if err := svc.updateFilterDirectTraffic(false); err != nil {
+		t.Fatalf("updateFilterDirectTraffic(false): %v", err)
+	}
+
+	second := &connectionsResponse{
+		Connections: []connection{testConnection("conn-1", []string{"DIRECT"}, 500, 500)},
+	}
+	if err := svc.processConnections(second); err != nil {
+		t.Fatalf("processConnections second: %v", err)
+	}
+
+	if len(svc.aggregateBuffer) != 1 {
+		t.Fatalf("expected 1 buffer entry after re-enabling tracking, got %d", len(svc.aggregateBuffer))
+	}
+	for _, entry := range svc.aggregateBuffer {
+		if entry.Upload != 400 || entry.Download != 400 {
+			t.Fatalf("expected only the 400 byte delta to be recorded, got %+v", entry)
+		}
+	}
+}
+
 func TestProcessConnectionsAutoSwitchTriggersOncePerMinute(t *testing.T) {
 	svc := newTestService(t)
 
@@ -3230,6 +3316,40 @@ func TestEmbeddedIndexDisablesPeriodicAutoRefresh(t *testing.T) {
 	}
 }
 
+func TestEmbeddedIndexIncludesDirectTrafficFilterToggle(t *testing.T) {
+	content, err := webAssets.ReadFile("web/index.html")
+	if err != nil {
+		t.Fatalf("read embedded index.html: %v", err)
+	}
+	html := string(content)
+
+	scriptContent, err := webAssets.ReadFile("web/app.js")
+	if err != nil {
+		t.Fatalf("read embedded app.js: %v", err)
+	}
+	script := string(scriptContent)
+
+	for _, want := range []string{
+		`id="filterDirectTraffic"`,
+		"过滤 DIRECT 直连流量",
+	} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("expected embedded index.html to contain %q", want)
+		}
+	}
+
+	for _, want := range []string{
+		`filterDirectTraffic: document.getElementById("filterDirectTraffic")`,
+		`elements.filterDirectTraffic.checked = Boolean(state.filterDirectTraffic)`,
+		`fetchJSON("/api/settings/direct-traffic-filter")`,
+		`sendJSON("/api/settings/direct-traffic-filter", "PUT", directFilterPayload)`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("expected embedded app.js to contain %q", want)
+		}
+	}
+}
+
 func TestEmbeddedIndexIncludesGithubAndLicenseFooter(t *testing.T) {
 	content, err := webAssets.ReadFile("web/index.html")
 	if err != nil {
@@ -3553,15 +3673,34 @@ func newTestService(t *testing.T) *service {
 		_ = db.Close()
 	})
 
+	return newTestServiceOnDB(db)
+}
+
+func newTestServiceOnDB(db *sql.DB) *service {
 	return &service{
 		db:                     db,
 		now:                    time.Now,
 		domainGroupingEnabled:  loadDomainGroupingEnabled(db),
+		filterDirectTraffic:    loadFilterDirectTraffic(db),
 		aggregateRetentionDays: loadRetentionDays(db),
 		lastConnections:        make(map[string]connection),
 		aggregateBuffer:        make(map[string]*aggregatedEntry),
 		hostMinuteWindows:      make(map[string]*hostTrafficWindow),
 	}
+}
+
+func testConnection(id string, chains []string, upload, download int64) connection {
+	conn := connection{
+		ID:       id,
+		Upload:   upload,
+		Download: download,
+		Chains:   chains,
+	}
+	conn.Metadata.SourceIP = "192.168.1.2"
+	conn.Metadata.Host = "example.com"
+	conn.Metadata.DestinationIP = "1.1.1.1"
+	conn.Metadata.Process = "chrome"
+	return conn
 }
 
 func insertTestLogs(t *testing.T, db *sql.DB, logs []trafficLog) {
@@ -3729,6 +3868,72 @@ func TestHandleDomainGroupingSettings(t *testing.T) {
 
 	t.Run("DELETE returns 405", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodDelete, "/api/settings/domain-grouping", nil)
+		rec := httptest.NewRecorder()
+		svc.routes().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("expected 405, got %d", rec.Code)
+		}
+	})
+}
+
+func TestHandleDirectTrafficFilterSettings(t *testing.T) {
+	svc := newTestService(t)
+
+	t.Run("GET returns default false", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/settings/direct-traffic-filter", nil)
+		rec := httptest.NewRecorder()
+		svc.routes().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET status %d: %s", rec.Code, rec.Body.String())
+		}
+		var resp map[string]interface{}
+		if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if resp["enabled"] != false {
+			t.Fatalf("expected enabled=false, got %v", resp["enabled"])
+		}
+	})
+
+	t.Run("PUT sets true", func(t *testing.T) {
+		body := bytes.NewBufferString(`{"enabled":true}`)
+		req := httptest.NewRequest(http.MethodPut, "/api/settings/direct-traffic-filter", body)
+		rec := httptest.NewRecorder()
+		svc.routes().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("PUT status %d: %s", rec.Code, rec.Body.String())
+		}
+		var resp map[string]interface{}
+		if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if resp["enabled"] != true {
+			t.Fatalf("expected enabled=true, got %v", resp["enabled"])
+		}
+		if !svc.currentFilterDirectTraffic() {
+			t.Fatal("expected in-memory state to be true")
+		}
+		if !loadFilterDirectTraffic(svc.db) {
+			t.Fatal("expected the setting to be persisted")
+		}
+	})
+
+	t.Run("PUT bad JSON returns 400", func(t *testing.T) {
+		body := bytes.NewBufferString(`not-json`)
+		req := httptest.NewRequest(http.MethodPut, "/api/settings/direct-traffic-filter", body)
+		rec := httptest.NewRecorder()
+		svc.routes().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400, got %d", rec.Code)
+		}
+	})
+
+	t.Run("DELETE returns 405", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodDelete, "/api/settings/direct-traffic-filter", nil)
 		rec := httptest.NewRecorder()
 		svc.routes().ServeHTTP(rec, req)
 

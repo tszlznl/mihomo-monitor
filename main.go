@@ -185,6 +185,7 @@ type service struct {
 	mu                     sync.Mutex
 	mihomoSettings         mihomoSettings
 	domainGroupingEnabled  bool
+	filterDirectTraffic    bool
 	lastConnections        map[string]connection
 	lastUploadTotal        int64
 	lastDownloadTotal      int64
@@ -237,15 +238,14 @@ func main() {
 		log.Fatalf("resolve mihomo settings: %v", err)
 	}
 
-	domainGroupingEnabled := loadDomainGroupingEnabled(db)
-
 	svc := &service{
 		db:                     db,
 		client:                 &http.Client{Timeout: 10 * time.Second},
 		now:                    time.Now,
 		cfg:                    cfg,
 		mihomoSettings:         runtimeSettings,
-		domainGroupingEnabled:  domainGroupingEnabled,
+		domainGroupingEnabled:  loadDomainGroupingEnabled(db),
+		filterDirectTraffic:    loadFilterDirectTraffic(db),
 		aggregateRetentionDays: loadRetentionDays(db),
 		lastConnections:        make(map[string]connection),
 		lastVacuum:             time.Time{},
@@ -584,6 +584,28 @@ func saveDomainGroupingEnabled(db *sql.DB, enabled bool) error {
 	_, err := db.Exec(`
 		INSERT INTO app_settings (key, value)
 		VALUES ('domain_grouping_enabled', ?)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value
+	`, value)
+	return err
+}
+
+func loadFilterDirectTraffic(db *sql.DB) bool {
+	var value string
+	err := db.QueryRow(`SELECT value FROM app_settings WHERE key = 'filter_direct_traffic'`).Scan(&value)
+	if err != nil {
+		return false // default off
+	}
+	return value == "true"
+}
+
+func saveFilterDirectTraffic(db *sql.DB, enabled bool) error {
+	value := "false"
+	if enabled {
+		value = "true"
+	}
+	_, err := db.Exec(`
+		INSERT INTO app_settings (key, value)
+		VALUES ('filter_direct_traffic', ?)
 		ON CONFLICT(key) DO UPDATE SET value = excluded.value
 	`, value)
 	return err
@@ -1235,6 +1257,22 @@ func (s *service) updateDomainGroupingEnabled(enabled bool) error {
 	return nil
 }
 
+func (s *service) currentFilterDirectTraffic() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.filterDirectTraffic
+}
+
+func (s *service) updateFilterDirectTraffic(enabled bool) error {
+	if err := saveFilterDirectTraffic(s.db, enabled); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.filterDirectTraffic = enabled
+	s.mu.Unlock()
+	return nil
+}
+
 func (s *service) currentRetentionDays() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1330,6 +1368,14 @@ func (s *service) processConnections(payload *connectionsResponse) error {
 			downloadDelta = conn.Download
 		}
 		if uploadDelta == 0 && downloadDelta == 0 {
+			s.lastConnections[conn.ID] = conn
+			continue
+		}
+
+		if s.filterDirectTraffic && isDirectConnection(conn.Chains) {
+			// Direct traffic is dropped from statistics while the filter is on.
+			// The baseline snapshot still advances so that turning the filter
+			// off later does not replay the skipped bytes as a single spike.
 			s.lastConnections[conn.ID] = conn
 			continue
 		}
@@ -2095,6 +2141,7 @@ func (s *service) routes() http.Handler {
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/api/settings/mihomo", s.handleMihomoSettings)
 	mux.HandleFunc("/api/settings/domain-grouping", s.handleDomainGroupingSettings)
+	mux.HandleFunc("/api/settings/direct-traffic-filter", s.handleDirectTrafficFilterSettings)
 	mux.HandleFunc("/api/settings/retention", s.handleRetentionSettings)
 	mux.HandleFunc("/api/auto-switch/settings", s.handleAutoSwitchSettings)
 	mux.HandleFunc("/api/auto-switch/groups", s.handleAutoSwitchGroups)
@@ -2193,6 +2240,29 @@ func (s *service) handleDomainGroupingSettings(w http.ResponseWriter, r *http.Re
 			return
 		}
 		writeJSON(w, http.StatusOK, domainGroupingResponse{Enabled: s.currentDomainGroupingEnabled()})
+	default:
+		writeMethodNotAllowed(w)
+	}
+}
+
+func (s *service) handleDirectTrafficFilterSettings(w http.ResponseWriter, r *http.Request) {
+	type directTrafficFilterResponse struct {
+		Enabled bool `json:"enabled"`
+	}
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, directTrafficFilterResponse{Enabled: s.currentFilterDirectTraffic()})
+	case http.MethodPut:
+		var payload directTrafficFilterResponse
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			writeError(w, http.StatusBadRequest, errors.New("invalid json body"))
+			return
+		}
+		if err := s.updateFilterDirectTraffic(payload.Enabled); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, directTrafficFilterResponse{Enabled: s.currentFilterDirectTraffic()})
 	default:
 		writeMethodNotAllowed(w)
 	}
@@ -3456,14 +3526,28 @@ func ruleGroupLabel(rule, rulePayload string) string {
 
 func outboundName(chains []string) string {
 	if len(chains) == 0 || chains[0] == "" {
-		return "DIRECT"
+		return directOutboundName
 	}
 	return chains[0]
 }
 
+// directOutboundName is the outbound Clash/Mihomo reports for connections that
+// bypass every proxy node. A chain that contains it never reached a proxy, so
+// the connection counts as direct traffic.
+const directOutboundName = "DIRECT"
+
+func isDirectConnection(chains []string) bool {
+	for _, hop := range sanitizeChains(chains) {
+		if strings.EqualFold(strings.TrimSpace(hop), directOutboundName) {
+			return true
+		}
+	}
+	return false
+}
+
 func sanitizeChains(chains []string) []string {
 	if len(chains) == 0 {
-		return []string{"DIRECT"}
+		return []string{directOutboundName}
 	}
 
 	cleaned := make([]string, 0, len(chains))
@@ -3474,7 +3558,7 @@ func sanitizeChains(chains []string) []string {
 		}
 	}
 	if len(cleaned) == 0 {
-		return []string{"DIRECT"}
+		return []string{directOutboundName}
 	}
 	return cleaned
 }

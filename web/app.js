@@ -72,6 +72,7 @@ const elements = {
   settingsCancelBtn: document.getElementById("settingsCancelBtn"),
   domainGroupingEnabled: document.getElementById("domainGroupingEnabled"),
   retentionDays: document.getElementById("retentionDays"),
+  filterDirectTraffic: document.getElementById("filterDirectTraffic"),
   settingsCloseBtn: document.getElementById("settingsCloseBtn"),
   settingsBtn: document.getElementById("settingsBtn"),
   autoSwitchBtn: document.getElementById("autoSwitchBtn"),
@@ -127,6 +128,7 @@ const state = {
     secret: "",
   },
   domainGroupingEnabled: false,
+  filterDirectTraffic: false,
   retentionDays: 30,
   summaryRangeDays: 120,
   mode: "detail",
@@ -511,6 +513,7 @@ function syncSettingsForm() {
   elements.settingsUrl.value = state.mihomoSettings.url || ""
   elements.settingsSecret.value = state.mihomoSettings.secret || ""
   elements.domainGroupingEnabled.checked = Boolean(state.domainGroupingEnabled)
+  elements.filterDirectTraffic.checked = Boolean(state.filterDirectTraffic)
   elements.retentionDays.value = state.retentionDays
 }
 
@@ -733,9 +736,10 @@ function collectAutoSwitchGroupTargets() {
 }
 
 async function loadSettings() {
-  const [settings, grouping, retention] = await Promise.all([
+  const [settings, grouping, directFilter, retention] = await Promise.all([
     fetchJSON("/api/settings/mihomo"),
     fetchJSON("/api/settings/domain-grouping"),
+    fetchJSON("/api/settings/direct-traffic-filter"),
     fetchJSON("/api/settings/retention"),
   ])
   state.mihomoSettings = {
@@ -743,6 +747,7 @@ async function loadSettings() {
     secret: settings.secret || "",
   }
   state.domainGroupingEnabled = Boolean(grouping.enabled)
+  state.filterDirectTraffic = Boolean(directFilter.enabled)
   state.retentionDays = retention.days || 30
   syncModeUI()
   state.settingsRequired = !state.mihomoSettings.url
@@ -796,6 +801,7 @@ async function saveSettings(event) {
     secret: elements.settingsSecret.value.trim(),
   }
   const groupingPayload = { enabled: elements.domainGroupingEnabled.checked }
+  const directFilterPayload = { enabled: elements.filterDirectTraffic.checked }
   const retentionDays = Math.max(1, Math.min(365, Number(elements.retentionDays.value) || 30))
   const retentionPayload = { days: retentionDays }
 
@@ -806,6 +812,7 @@ async function saveSettings(event) {
     const [saved] = await Promise.all([
       sendJSON("/api/settings/mihomo", "PUT", mihomoPayload),
       sendJSON("/api/settings/domain-grouping", "PUT", groupingPayload),
+      sendJSON("/api/settings/direct-traffic-filter", "PUT", directFilterPayload),
       sendJSON("/api/settings/retention", "PUT", retentionPayload),
     ])
     state.mihomoSettings = {
@@ -813,6 +820,7 @@ async function saveSettings(event) {
       secret: saved.secret || "",
     }
     state.domainGroupingEnabled = groupingPayload.enabled
+    state.filterDirectTraffic = directFilterPayload.enabled
     state.retentionDays = retentionDays
     state.settingsRequired = !state.mihomoSettings.url
     state.settingsOpen = false
