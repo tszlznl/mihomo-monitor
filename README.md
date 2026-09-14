@@ -227,3 +227,6 @@ docker run -d \
 
 - 页面接口参考了 [MetaCubeX/metacubexd](https://github.com/MetaCubeX/metacubexd)。
 - [LinuxDO](https://linux.do) - the community where it all began
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=zhf883680/clash-traffic-monitor&type=Date)](https://star-history.com/#zhf883680/clash-traffic-monitor&Date)
