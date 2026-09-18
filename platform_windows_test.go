@@ -811,27 +811,36 @@ func (f *fakeAutoStartStore) isEnabled() bool {
 
 // newSupervisorTestApplication builds an application whose collector is
 // already quiet so shutdown completes immediately.
-func newSupervisorTestApplication(t *testing.T) *application {
+func newSupervisorTestApplication(t *testing.T) (*application, string) {
 	t.Helper()
-	svc := newTestService(t)
+	dbPath := filepath.Join(t.TempDir(), "traffic.db")
+	db, err := openDatabase(dbPath)
+	if err != nil {
+		t.Fatalf("openDatabase: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = db.Close()
+	})
+	svc := newTestServiceOnDB(db)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	quiet := make(chan struct{})
 	close(quiet)
 	return &application{
 		cfg:           config{ListenAddr: "127.0.0.1:0"},
-		db:            svc.db,
+		db:            db,
 		svc:           svc,
 		server:        &http.Server{Handler: svc.routes(), ReadHeaderTimeout: 5 * time.Second},
 		ctx:           ctx,
 		cancel:        cancel,
 		collectorDone: quiet,
 		serverErr:     make(chan error, 1),
-	}
+	}, dbPath
 }
 
 type supervisorHarness struct {
 	app        *application
+	dbPath     string
 	runner     *fakeTrayRunner
 	store      *fakeAutoStartStore
 	logWriter  *rotatingLogWriter
@@ -858,8 +867,10 @@ func newSupervisorHarness(t *testing.T, exePath string, initialAutoStart bool) *
 		t.Fatalf("newRotatingLogWriter: %v", err)
 	}
 
+	app, dbPath := newSupervisorTestApplication(t)
 	h := &supervisorHarness{
-		app:       newSupervisorTestApplication(t),
+		app:       app,
+		dbPath:    dbPath,
 		runner:    newFakeTrayRunner(),
 		store:     &fakeAutoStartStore{},
 		logWriter: logWriter,
@@ -939,6 +950,24 @@ func (h *supervisorHarness) messageBoxCount(t *testing.T) int {
 func TestTraySupervisorQuitShutsDownApplication(t *testing.T) {
 	h := newSupervisorHarness(t, `C:\Program Files\Traffic Monitor\app.exe`, false)
 
+	// Buffer an aggregate that only a graceful shutdown flush will persist.
+	bucketStart := (time.Now().UnixMilli() / 60000) * 60000
+	h.app.svc.mu.Lock()
+	h.app.svc.aggregateBuffer["qa-flush"] = &aggregatedEntry{
+		BucketStart: bucketStart,
+		BucketEnd:   bucketStart + 60000,
+		SourceIP:    "192.168.1.2",
+		Host:        "flush.example",
+		Process:     "chrome",
+		Outbound:    "DIRECT",
+		Chains:      `["DIRECT"]`,
+		RuleGroup:   unknownRuleGroup,
+		Upload:      21,
+		Download:    14,
+		Count:       1,
+	}
+	h.app.svc.mu.Unlock()
+
 	h.quitCh <- struct{}{}
 
 	select {
@@ -957,6 +986,19 @@ func TestTraySupervisorQuitShutsDownApplication(t *testing.T) {
 	}
 	if err := h.app.db.Ping(); err == nil {
 		t.Fatal("application database must be closed after quit")
+	}
+
+	reopened, err := sql.Open("sqlite3", h.dbPath)
+	if err != nil {
+		t.Fatalf("reopen database: %v", err)
+	}
+	defer reopened.Close()
+	var flushed int
+	if err := reopened.QueryRow(`SELECT upload + download FROM traffic_aggregated WHERE host = 'flush.example'`).Scan(&flushed); err != nil {
+		t.Fatalf("flushed aggregate missing after shutdown: %v", err)
+	}
+	if flushed != 35 {
+		t.Fatalf("expected flushed total 35, got %d", flushed)
 	}
 }
 
