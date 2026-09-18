@@ -54,6 +54,7 @@
 - 使用分钟级聚合落盘到 SQLite，磁盘占用更可控，查询也更直接。
 - 提供内置 Web 页面，无需额外部署前端服务或数据库。
 - 支持本地二进制直接运行，也支持 Docker 部署，适合单机和 OpenWrt 场景。
+- Windows 版本提供系统托盘与开机自动启动；Linux、macOS 与 Docker 保持无界面的服务形态。
 
 ## 项目现状
 
@@ -87,6 +88,18 @@
 .\traffic-monitor-windows-amd64.exe
 ```
 
+Windows 版本是托盘程序：双击后没有控制台窗口，只在通知区域出现一个图标，右键托盘图标可以使用：
+
+- `打开统计页`：用默认浏览器打开实际监听地址对应的页面。
+- `开机自动启动`：写入当前用户的注册表 `HKCU\...\Run`，不需要管理员权限；程序移动位置后需要重新勾选一次。
+- `退出`：停止采集、把内存中的聚合数据落盘后退出。
+
+Windows 使用约定：
+
+- 数据库和日志固定放在 exe 旁边的 `data` 目录（`traffic_monitor.db`、`traffic-monitor.log`，日志按 5 MiB 轮转并保留一份备份），与启动时的工作目录无关。旧版本放在工作目录下的数据库会在首次运行时自动迁移到新位置，旧文件保留作备份。
+- 同一个登录会话内只运行一个实例；重复双击不会报端口错误，只会打开已运行实例的统计页。
+- 通过托盘退出会完成刷盘；用任务管理器强制结束仍可能丢失最近最多 10 分钟未刷盘的数据。
+
 #### Linux
 
 下载文件：
@@ -116,7 +129,7 @@ chmod +x ./traffic-monitor-macos-arm64
 如果你是从源码本地编译，也可以直接这样运行：
 
 ```bash
-go build -o traffic-monitor main.go
+go build -o traffic-monitor .
 ./traffic-monitor
 ```
 
@@ -193,7 +206,7 @@ docker run -d \
 
 - 只把分钟级聚合数据写入 `traffic_aggregated`，不再持久化逐条原始连接日志。
 - 聚合数据固定保留 30 天。
-- 本地直接运行时，默认数据库文件是 `./data/traffic_monitor.db`。
+- 本地直接运行时（Linux/macOS），默认数据库文件是 `./data/traffic_monitor.db`；Windows 下固定为 exe 旁边的 `data\traffic_monitor.db`。
 - Docker 容器内运行时，默认数据库文件是 `/data/traffic_monitor.db`。
 - 采集增量先进入内存缓冲，每 10 分钟批量刷盘一次。
 - 正常运行时，页面查询会把已落盘聚合数据和当前内存缓冲一起合并，所以最近几分钟也能查到。
