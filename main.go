@@ -13,13 +13,11 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -46,6 +44,10 @@ var isContainerRuntime = func() bool {
 	_, err := os.Stat("/.dockerenv")
 	return err == nil
 }
+
+// collectorShutdownTimeout bounds the wait for the collector goroutine during
+// shutdown. It is a variable so tests can shorten it.
+var collectorShutdownTimeout = 5 * time.Second
 
 type config struct {
 	ListenAddr   string
@@ -221,21 +223,58 @@ type hostTrafficWindow struct {
 	TotalBytes  int64
 }
 
+// application owns the runtime components (database, service, HTTP server and
+// collector) so that every platform entrypoint can start them and later stop
+// them through one idempotent shutdown path.
+type application struct {
+	cfg           config
+	db            *sql.DB
+	svc           *service
+	server        *http.Server
+	listener      net.Listener
+	ctx           context.Context
+	cancel        context.CancelFunc
+	collectorDone chan struct{}
+	serverErr     chan error
+	shutdownOnce  sync.Once
+	shutdownErr   error
+}
+
 func main() {
-	cfg, err := loadConfig()
+	if err := runPlatform(); err != nil {
+		reportPlatformFatal(err)
+		os.Exit(1)
+	}
+}
+
+func newApplication(cfg config, dbPath string) (*application, error) {
+	db, err := openDatabase(dbPath)
 	if err != nil {
-		log.Fatalf("load config: %v", err)
+		return nil, err
 	}
 
-	db, err := openDatabase(defaultDatabasePath())
-	if err != nil {
-		log.Fatalf("open database: %v", err)
+	app := &application{
+		cfg:           cfg,
+		db:            db,
+		collectorDone: make(chan struct{}),
+		serverErr:     make(chan error, 1),
 	}
-	defer db.Close()
+
+	closeDBOnError := func(cause error) (*application, error) {
+		if closeErr := db.Close(); closeErr != nil {
+			log.Printf("close database after failed startup: %v", closeErr)
+		}
+		return nil, cause
+	}
 
 	runtimeSettings, err := resolveMihomoSettings(db, cfg.MihomoURL, cfg.MihomoSecret)
 	if err != nil {
-		log.Fatalf("resolve mihomo settings: %v", err)
+		return closeDBOnError(fmt.Errorf("resolve mihomo settings: %w", err))
+	}
+
+	listener, err := net.Listen("tcp", cfg.ListenAddr)
+	if err != nil {
+		return closeDBOnError(fmt.Errorf("listen on %s: %w", cfg.ListenAddr, err))
 	}
 
 	svc := &service{
@@ -253,50 +292,85 @@ func main() {
 		hostMinuteWindows:      make(map[string]*hostTrafficWindow),
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	collectorDone := make(chan struct{})
-	go func() {
-		defer close(collectorDone)
-		svc.runCollector(ctx)
-	}()
-
-	server := &http.Server{
-		Addr:              cfg.ListenAddr,
+	app.svc = svc
+	app.listener = listener
+	app.server = &http.Server{
 		Handler:           svc.routes(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
+	app.ctx, app.cancel = context.WithCancel(context.Background())
 
+	return app, nil
+}
+
+func (a *application) start() {
+	collectorDone := a.collectorDone
 	go func() {
-		log.Printf("traffic monitor listening on %s", cfg.ListenAddr)
-		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("http server: %v", err)
-		}
+		defer close(collectorDone)
+		a.svc.runCollector(a.ctx)
 	}()
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	<-sigCh
+	go func() {
+		log.Printf("traffic monitor listening on %s", a.cfg.ListenAddr)
+		if err := a.server.Serve(a.listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			select {
+			case a.serverErr <- fmt.Errorf("http server: %w", err):
+			default:
+			}
+		}
+	}()
+}
 
-	cancel()
-	select {
-	case <-collectorDone:
-	case <-time.After(5 * time.Second):
-		log.Printf("collector shutdown timed out")
-	}
-	if err := svc.flushAggregateBuffer(); err != nil {
-		log.Printf("flush aggregate buffer on shutdown: %v", err)
-	}
-	if err := backfillSummary(svc.db, time.Now().UnixMilli()); err != nil {
-		log.Printf("build traffic summary on shutdown: %v", err)
-	}
+func (a *application) errors() <-chan error {
+	return a.serverErr
+}
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer shutdownCancel()
-	if err := server.Shutdown(shutdownCtx); err != nil {
+func (a *application) shutdown() error {
+	a.shutdownOnce.Do(func() {
+		a.shutdownErr = a.shutdownApplication()
+	})
+	return a.shutdownErr
+}
+
+func (a *application) shutdownApplication() error {
+	a.cancel()
+
+	var errs []error
+
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelShutdown()
+	if err := a.server.Shutdown(shutdownCtx); err != nil {
 		log.Printf("shutdown server: %v", err)
+		errs = append(errs, fmt.Errorf("shutdown server: %w", err))
 	}
+
+	select {
+	case <-a.collectorDone:
+	case <-time.After(collectorShutdownTimeout):
+		log.Printf("collector shutdown timed out")
+		errs = append(errs, errors.New("collector shutdown timed out"))
+	}
+
+	if len(errs) > 0 {
+		// HTTP handlers or the collector are still running; flushing or closing
+		// the database now would race with them. Process exit closes the DB.
+		errs = append(errs, errors.New("skipping final flush and database close: shutdown deadline exceeded"))
+		return errors.Join(errs...)
+	}
+
+	if err := a.svc.flushAggregateBuffer(); err != nil {
+		log.Printf("flush aggregate buffer on shutdown: %v", err)
+		errs = append(errs, fmt.Errorf("flush aggregate buffer: %w", err))
+	}
+	if err := backfillSummary(a.db, time.Now().UnixMilli()); err != nil {
+		log.Printf("build traffic summary on shutdown: %v", err)
+		errs = append(errs, fmt.Errorf("build traffic summary: %w", err))
+	}
+	if err := a.db.Close(); err != nil {
+		log.Printf("close database on shutdown: %v", err)
+		errs = append(errs, fmt.Errorf("close database: %w", err))
+	}
+	return errors.Join(errs...)
 }
 
 func loadConfig() (config, error) {
@@ -939,12 +1013,12 @@ func normalizeProxyGroupType(raw string) string {
 	}
 }
 
-func (s *service) listControllableProxyGroups(settings mihomoSettings) ([]controllableProxyGroup, error) {
+func (s *service) listControllableProxyGroups(ctx context.Context, settings mihomoSettings) ([]controllableProxyGroup, error) {
 	if settings.URL == "" {
 		return nil, errors.New("mihomo url is not configured")
 	}
 
-	req, err := http.NewRequest(http.MethodGet, settings.URL+"/proxies", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, settings.URL+"/proxies", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -994,7 +1068,7 @@ func (s *service) listControllableProxyGroups(settings mihomoSettings) ([]contro
 	return groups, nil
 }
 
-func (s *service) switchProxyGroup(settings mihomoSettings, group controllableProxyGroup, targetProxy string) error {
+func (s *service) switchProxyGroup(ctx context.Context, settings mihomoSettings, group controllableProxyGroup, targetProxy string) error {
 	group.Type = normalizeProxyGroupType(group.Type)
 	if group.Type == "" {
 		return errors.New("proxy group type is not controllable")
@@ -1013,7 +1087,7 @@ func (s *service) switchProxyGroup(settings mihomoSettings, group controllablePr
 		return err
 	}
 
-	req, err := http.NewRequest(http.MethodPut, settings.URL+"/proxies/"+group.Name, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, settings.URL+"/proxies/"+group.Name, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -1206,7 +1280,7 @@ func (s *service) collectOnce(ctx context.Context) {
 		return
 	}
 
-	if err := s.processConnections(resp); err != nil {
+	if err := s.processConnections(ctx, resp); err != nil {
 		log.Printf("process connections: %v", err)
 	}
 }
@@ -1333,7 +1407,7 @@ func (s *service) currentTime() time.Time {
 	return time.Now()
 }
 
-func (s *service) processConnections(payload *connectionsResponse) error {
+func (s *service) processConnections(ctx context.Context, payload *connectionsResponse) error {
 	now := s.currentTime()
 	nowMS := now.UnixMilli()
 
@@ -1407,11 +1481,11 @@ func (s *service) processConnections(payload *connectionsResponse) error {
 		if err := s.addToAggregateBuffer(logs, nowMS); err != nil {
 			return err
 		}
-		if err := s.evaluateAutoSwitch(logs, nowMS); err != nil {
+		if err := s.evaluateAutoSwitch(ctx, logs, nowMS); err != nil {
 			log.Printf("auto switch evaluation: %v", err)
 		}
 	}
-	if err := s.evaluateAutoRestore(nowMS); err != nil {
+	if err := s.evaluateAutoRestore(ctx, nowMS); err != nil {
 		log.Printf("auto restore evaluation: %v", err)
 	}
 
@@ -1446,7 +1520,7 @@ func (s *service) processConnections(payload *connectionsResponse) error {
 	return nil
 }
 
-func (s *service) evaluateAutoSwitch(logs []trafficLog, nowMS int64) error {
+func (s *service) evaluateAutoSwitch(ctx context.Context, logs []trafficLog, nowMS int64) error {
 	settings, err := loadAutoSwitchSettings(s.db)
 	if err != nil {
 		return err
@@ -1479,7 +1553,7 @@ func (s *service) evaluateAutoSwitch(logs []trafficLog, nowMS int64) error {
 		return nil
 	}
 
-	results, execErr := s.executeAutoSwitch(settings, enabledTargets[triggerGroup], nowMS, triggerHost, triggerTotal)
+	results, execErr := s.executeAutoSwitch(ctx, settings, enabledTargets[triggerGroup], nowMS, triggerHost, triggerTotal)
 	event := autoSwitchEvent{
 		TriggeredAt: nowMS,
 		Host:        triggerHost,
@@ -1596,6 +1670,7 @@ func (s *service) autoSwitchSuppressionReason(bucketStart, nowMS, cooldownSecond
 }
 
 func (s *service) executeAutoSwitch(
+	ctx context.Context,
 	settings autoSwitchSettings,
 	target autoSwitchGroupTarget,
 	triggeredAt int64,
@@ -1603,7 +1678,7 @@ func (s *service) executeAutoSwitch(
 	triggerTotal int64,
 ) ([]autoSwitchExecutionResult, error) {
 	mihomo := s.currentMihomoSettings()
-	groups, err := s.listControllableProxyGroups(mihomo)
+	groups, err := s.listControllableProxyGroups(ctx, mihomo)
 	if err != nil {
 		return nil, err
 	}
@@ -1617,6 +1692,7 @@ func (s *service) executeAutoSwitch(
 	results := make([]autoSwitchExecutionResult, 0, 1)
 	visited := make(map[string]struct{})
 	return s.executeAutoSwitchChain(
+		ctx,
 		settings,
 		mihomo,
 		groupByName,
@@ -1631,6 +1707,7 @@ func (s *service) executeAutoSwitch(
 }
 
 func (s *service) executeAutoSwitchChain(
+	ctx context.Context,
 	settings autoSwitchSettings,
 	mihomo mihomoSettings,
 	groupByName map[string]controllableProxyGroup,
@@ -1688,6 +1765,7 @@ func (s *service) executeAutoSwitchChain(
 			}
 		}
 		return s.continueAutoSwitchChainIfNeeded(
+			ctx,
 			settings,
 			mihomo,
 			groupByName,
@@ -1701,7 +1779,7 @@ func (s *service) executeAutoSwitchChain(
 		)
 	}
 
-	if err := s.switchProxyGroup(mihomo, group, target.TargetProxy); err != nil {
+	if err := s.switchProxyGroup(ctx, mihomo, group, target.TargetProxy); err != nil {
 		log.Printf("auto switch debug: switch failed group=%q from=%q to=%q host=%q total=%d err=%v",
 			target.GroupName, group.Now, target.TargetProxy, triggerHost, triggerTotal, err)
 		results = append(results, autoSwitchExecutionResult{
@@ -1741,6 +1819,7 @@ func (s *service) executeAutoSwitchChain(
 	group.Now = target.TargetProxy
 	groupByName[target.GroupName] = group
 	return s.continueAutoSwitchChainIfNeeded(
+		ctx,
 		settings,
 		mihomo,
 		groupByName,
@@ -1755,6 +1834,7 @@ func (s *service) executeAutoSwitchChain(
 }
 
 func (s *service) continueAutoSwitchChainIfNeeded(
+	ctx context.Context,
 	settings autoSwitchSettings,
 	mihomo mihomoSettings,
 	groupByName map[string]controllableProxyGroup,
@@ -1772,6 +1852,7 @@ func (s *service) continueAutoSwitchChainIfNeeded(
 	}
 
 	return s.executeAutoSwitchChain(
+		ctx,
 		settings,
 		mihomo,
 		groupByName,
@@ -1795,7 +1876,7 @@ func autoRestoreEligible(nowMS, lastTriggeredAt, quietMinutes int64) bool {
 	return currentBucketStart >= triggerBucketStart+quietMinutes*60000
 }
 
-func (s *service) evaluateAutoRestore(nowMS int64) error {
+func (s *service) evaluateAutoRestore(ctx context.Context, nowMS int64) error {
 	settings, err := loadAutoSwitchSettings(s.db)
 	if err != nil {
 		return err
@@ -1823,7 +1904,7 @@ func (s *service) evaluateAutoRestore(nowMS int64) error {
 	}
 
 	mihomo := s.currentMihomoSettings()
-	groups, err := s.listControllableProxyGroups(mihomo)
+	groups, err := s.listControllableProxyGroups(ctx, mihomo)
 	if err != nil {
 		return err
 	}
@@ -1878,7 +1959,7 @@ func (s *service) evaluateAutoRestore(nowMS int64) error {
 			continue
 		}
 
-		if err := s.switchProxyGroup(mihomo, group, session.OriginalProxy); err != nil {
+		if err := s.switchProxyGroup(ctx, mihomo, group, session.OriginalProxy); err != nil {
 			results = append(results, autoSwitchExecutionResult{
 				GroupName:   session.GroupName,
 				TargetProxy: session.OriginalProxy,
@@ -2352,7 +2433,7 @@ func (s *service) handleAutoSwitchGroups(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	groups, err := s.listControllableProxyGroups(s.currentMihomoSettings())
+	groups, err := s.listControllableProxyGroups(r.Context(), s.currentMihomoSettings())
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return

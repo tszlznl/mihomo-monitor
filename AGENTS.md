@@ -61,5 +61,5 @@ These instructions apply to the entire repository. If a deeper directory later g
 
 ```bash
 go test ./...
-go build -o traffic-monitor main.go
+go build -o traffic-monitor .
 ```

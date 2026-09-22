@@ -5,8 +5,10 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -494,7 +496,7 @@ func TestListControllableProxyGroupsFiltersToSelectAndFallback(t *testing.T) {
 		}),
 	}
 
-	got, err := svc.listControllableProxyGroups(mihomoSettings{
+	got, err := svc.listControllableProxyGroups(context.Background(), mihomoSettings{
 		URL:    "http://127.0.0.1:9090",
 		Secret: "test-secret",
 	})
@@ -522,7 +524,7 @@ func TestListControllableProxyGroupsFiltersToSelectAndFallback(t *testing.T) {
 func TestSwitchProxyGroupRejectsTargetOutsideCandidates(t *testing.T) {
 	svc := newTestService(t)
 
-	err := svc.switchProxyGroup(mihomoSettings{URL: "http://127.0.0.1:9090"}, controllableProxyGroup{
+	err := svc.switchProxyGroup(context.Background(), mihomoSettings{URL: "http://127.0.0.1:9090"}, controllableProxyGroup{
 		Name: "🌍 国外媒体",
 		Type: "select",
 		Now:  "🚩 PROXY",
@@ -566,7 +568,7 @@ func TestSwitchProxyGroupSendsSelectionRequest(t *testing.T) {
 		}),
 	}
 
-	err := svc.switchProxyGroup(mihomoSettings{
+	err := svc.switchProxyGroup(context.Background(), mihomoSettings{
 		URL:    "http://127.0.0.1:9090",
 		Secret: "test-secret",
 	}, controllableProxyGroup{
@@ -874,7 +876,7 @@ func TestProcessConnectionsBuffersAggregatesWithoutPersistingRawLogs(t *testing.
 		},
 	}
 
-	if err := svc.processConnections(payload); err != nil {
+	if err := svc.processConnections(context.Background(), payload); err != nil {
 		t.Fatalf("processConnections: %v", err)
 	}
 
@@ -913,7 +915,7 @@ func TestProcessConnectionsSkipsDirectTrafficWhenFilterEnabled(t *testing.T) {
 		},
 	}
 
-	if err := svc.processConnections(payload); err != nil {
+	if err := svc.processConnections(context.Background(), payload); err != nil {
 		t.Fatalf("processConnections: %v", err)
 	}
 
@@ -960,7 +962,7 @@ func TestDirectTrafficFilterKeepsBaselineSoReplayDoesNotSpike(t *testing.T) {
 	first := &connectionsResponse{
 		Connections: []connection{testConnection("conn-1", []string{"DIRECT"}, 100, 100)},
 	}
-	if err := svc.processConnections(first); err != nil {
+	if err := svc.processConnections(context.Background(), first); err != nil {
 		t.Fatalf("processConnections first: %v", err)
 	}
 	if len(svc.aggregateBuffer) != 0 {
@@ -974,7 +976,7 @@ func TestDirectTrafficFilterKeepsBaselineSoReplayDoesNotSpike(t *testing.T) {
 	second := &connectionsResponse{
 		Connections: []connection{testConnection("conn-1", []string{"DIRECT"}, 500, 500)},
 	}
-	if err := svc.processConnections(second); err != nil {
+	if err := svc.processConnections(context.Background(), second); err != nil {
 		t.Fatalf("processConnections second: %v", err)
 	}
 
@@ -1074,13 +1076,13 @@ func TestProcessConnectionsAutoSwitchTriggersOncePerMinute(t *testing.T) {
 		}},
 	}
 
-	if err := svc.processConnections(first); err != nil {
+	if err := svc.processConnections(context.Background(), first); err != nil {
 		t.Fatalf("processConnections first: %v", err)
 	}
-	if err := svc.processConnections(second); err != nil {
+	if err := svc.processConnections(context.Background(), second); err != nil {
 		t.Fatalf("processConnections second: %v", err)
 	}
-	if err := svc.processConnections(third); err != nil {
+	if err := svc.processConnections(context.Background(), third); err != nil {
 		t.Fatalf("processConnections third: %v", err)
 	}
 
@@ -1182,10 +1184,10 @@ func TestAutoSwitchOnlySwitchesTriggeredEnabledGroup(t *testing.T) {
 		}},
 	}
 
-	if err := svc.processConnections(first); err != nil {
+	if err := svc.processConnections(context.Background(), first); err != nil {
 		t.Fatalf("processConnections first: %v", err)
 	}
-	if err := svc.processConnections(second); err != nil {
+	if err := svc.processConnections(context.Background(), second); err != nil {
 		t.Fatalf("processConnections second: %v", err)
 	}
 
@@ -1282,10 +1284,10 @@ func TestAutoSwitchMatchesEnabledGroupWithinChains(t *testing.T) {
 		}},
 	}
 
-	if err := svc.processConnections(first); err != nil {
+	if err := svc.processConnections(context.Background(), first); err != nil {
 		t.Fatalf("processConnections first: %v", err)
 	}
-	if err := svc.processConnections(second); err != nil {
+	if err := svc.processConnections(context.Background(), second); err != nil {
 		t.Fatalf("processConnections second: %v", err)
 	}
 
@@ -1381,10 +1383,10 @@ func TestAutoSwitchIgnoresTrafficForGroupsNotEnabledInSettings(t *testing.T) {
 		}},
 	}
 
-	if err := svc.processConnections(first); err != nil {
+	if err := svc.processConnections(context.Background(), first); err != nil {
 		t.Fatalf("processConnections first: %v", err)
 	}
-	if err := svc.processConnections(second); err != nil {
+	if err := svc.processConnections(context.Background(), second); err != nil {
 		t.Fatalf("processConnections second: %v", err)
 	}
 
@@ -1473,12 +1475,12 @@ func TestAutoSwitchCooldownSkipsNextMinuteTrigger(t *testing.T) {
 		}},
 	}
 
-	if err := svc.processConnections(firstMinute); err != nil {
+	if err := svc.processConnections(context.Background(), firstMinute); err != nil {
 		t.Fatalf("processConnections firstMinute: %v", err)
 	}
 
 	currentTime = currentTime.Add(time.Minute)
-	if err := svc.processConnections(secondMinute); err != nil {
+	if err := svc.processConnections(context.Background(), secondMinute); err != nil {
 		t.Fatalf("processConnections secondMinute: %v", err)
 	}
 
@@ -1570,10 +1572,10 @@ func TestAutoSwitchCreatesRestoreSession(t *testing.T) {
 			}},
 		}
 
-		if err := svc.processConnections(first); err != nil {
+		if err := svc.processConnections(context.Background(), first); err != nil {
 			t.Fatalf("processConnections first: %v", err)
 		}
-		if err := svc.processConnections(second); err != nil {
+		if err := svc.processConnections(context.Background(), second); err != nil {
 			t.Fatalf("processConnections second: %v", err)
 		}
 
@@ -1681,10 +1683,10 @@ func TestAutoSwitchCreatesRestoreSession(t *testing.T) {
 			}},
 		}
 
-		if err := svc.processConnections(first); err != nil {
+		if err := svc.processConnections(context.Background(), first); err != nil {
 			t.Fatalf("processConnections first: %v", err)
 		}
-		if err := svc.processConnections(second); err != nil {
+		if err := svc.processConnections(context.Background(), second); err != nil {
 			t.Fatalf("processConnections second: %v", err)
 		}
 
@@ -1794,10 +1796,10 @@ func TestAutoSwitchCreatesRestoreSession(t *testing.T) {
 			}},
 		}
 
-		if err := svc.processConnections(first); err != nil {
+		if err := svc.processConnections(context.Background(), first); err != nil {
 			t.Fatalf("processConnections first: %v", err)
 		}
-		if err := svc.processConnections(second); err != nil {
+		if err := svc.processConnections(context.Background(), second); err != nil {
 			t.Fatalf("processConnections second: %v", err)
 		}
 
@@ -1897,10 +1899,10 @@ func TestAutoSwitchCreatesRestoreSession(t *testing.T) {
 			}},
 		}
 
-		if err := svc.processConnections(first); err != nil {
+		if err := svc.processConnections(context.Background(), first); err != nil {
 			t.Fatalf("processConnections first: %v", err)
 		}
-		if err := svc.processConnections(second); err != nil {
+		if err := svc.processConnections(context.Background(), second); err != nil {
 			t.Fatalf("processConnections second: %v", err)
 		}
 
@@ -2004,10 +2006,10 @@ func TestAutoSwitchCreatesRestoreSession(t *testing.T) {
 					}},
 				}
 
-				if err := svc.processConnections(first); err != nil {
+				if err := svc.processConnections(context.Background(), first); err != nil {
 					t.Fatalf("processConnections first: %v", err)
 				}
-				if err := svc.processConnections(second); err != nil && tc.name != "failed" {
+				if err := svc.processConnections(context.Background(), second); err != nil && tc.name != "failed" {
 					t.Fatalf("processConnections second: %v", err)
 				}
 
@@ -2110,15 +2112,15 @@ func TestAutoSwitchCreatesRestoreSession(t *testing.T) {
 			}},
 		}
 
-		if err := svc.processConnections(firstMinute); err != nil {
+		if err := svc.processConnections(context.Background(), firstMinute); err != nil {
 			t.Fatalf("processConnections firstMinute: %v", err)
 		}
-		if err := svc.processConnections(firstMinuteTrigger); err != nil {
+		if err := svc.processConnections(context.Background(), firstMinuteTrigger); err != nil {
 			t.Fatalf("processConnections firstMinuteTrigger: %v", err)
 		}
 
 		currentTime = currentTime.Add(time.Minute)
-		if err := svc.processConnections(secondMinuteTrigger); err != nil {
+		if err := svc.processConnections(context.Background(), secondMinuteTrigger); err != nil {
 			t.Fatalf("processConnections secondMinuteTrigger: %v", err)
 		}
 
@@ -2147,32 +2149,32 @@ func TestAutoSwitchCreatesRestoreSession(t *testing.T) {
 func TestAutoRestore(t *testing.T) {
 	newTriggerResponses := func(host string) (*connectionsResponse, *connectionsResponse) {
 		return &connectionsResponse{
-				Connections: []connection{{
-					ID:       "conn-1",
-					Upload:   100,
-					Download: 100,
-					Chains:   []string{"🌍 国外媒体"},
-					Metadata: struct {
-						SourceIP      string "json:\"sourceIP\""
-						Host          string "json:\"host\""
-						DestinationIP string "json:\"destinationIP\""
-						Process       string "json:\"process\""
-					}{SourceIP: "192.168.1.2", Host: host, DestinationIP: "1.1.1.1", Process: "chrome"},
-				}},
-			}, &connectionsResponse{
-				Connections: []connection{{
-					ID:       "conn-1",
-					Upload:   250,
-					Download: 150,
-					Chains:   []string{"🌍 国外媒体"},
-					Metadata: struct {
-						SourceIP      string "json:\"sourceIP\""
-						Host          string "json:\"host\""
-						DestinationIP string "json:\"destinationIP\""
-						Process       string "json:\"process\""
-					}{SourceIP: "192.168.1.2", Host: host, DestinationIP: "1.1.1.1", Process: "chrome"},
-				}},
-			}
+			Connections: []connection{{
+				ID:       "conn-1",
+				Upload:   100,
+				Download: 100,
+				Chains:   []string{"🌍 国外媒体"},
+				Metadata: struct {
+					SourceIP      string "json:\"sourceIP\""
+					Host          string "json:\"host\""
+					DestinationIP string "json:\"destinationIP\""
+					Process       string "json:\"process\""
+				}{SourceIP: "192.168.1.2", Host: host, DestinationIP: "1.1.1.1", Process: "chrome"},
+			}},
+		}, &connectionsResponse{
+			Connections: []connection{{
+				ID:       "conn-1",
+				Upload:   250,
+				Download: 150,
+				Chains:   []string{"🌍 国外媒体"},
+				Metadata: struct {
+					SourceIP      string "json:\"sourceIP\""
+					Host          string "json:\"host\""
+					DestinationIP string "json:\"destinationIP\""
+					Process       string "json:\"process\""
+				}{SourceIP: "192.168.1.2", Host: host, DestinationIP: "1.1.1.1", Process: "chrome"},
+			}},
+		}
 	}
 
 	t.Run("restore happens after quiet minutes with no new trigger", func(t *testing.T) {
@@ -2231,15 +2233,15 @@ func TestAutoRestore(t *testing.T) {
 		}
 
 		first, trigger := newTriggerResponses("video.example")
-		if err := svc.processConnections(first); err != nil {
+		if err := svc.processConnections(context.Background(), first); err != nil {
 			t.Fatalf("processConnections first: %v", err)
 		}
-		if err := svc.processConnections(trigger); err != nil {
+		if err := svc.processConnections(context.Background(), trigger); err != nil {
 			t.Fatalf("processConnections trigger: %v", err)
 		}
 
 		currentTime = currentTime.Add(2 * time.Minute)
-		if err := svc.processConnections(&connectionsResponse{}); err != nil {
+		if err := svc.processConnections(context.Background(), &connectionsResponse{}); err != nil {
 			t.Fatalf("processConnections restore tick: %v", err)
 		}
 
@@ -2319,10 +2321,10 @@ func TestAutoRestore(t *testing.T) {
 		}
 
 		first, trigger := newTriggerResponses("video.example")
-		if err := svc.processConnections(first); err != nil {
+		if err := svc.processConnections(context.Background(), first); err != nil {
 			t.Fatalf("processConnections first: %v", err)
 		}
-		if err := svc.processConnections(trigger); err != nil {
+		if err := svc.processConnections(context.Background(), trigger); err != nil {
 			t.Fatalf("processConnections trigger: %v", err)
 		}
 
@@ -2341,12 +2343,12 @@ func TestAutoRestore(t *testing.T) {
 				}{SourceIP: "192.168.1.3", Host: "download.example", DestinationIP: "8.8.8.8", Process: "wget"},
 			}},
 		}
-		if err := svc.processConnections(nextMinute); err != nil {
+		if err := svc.processConnections(context.Background(), nextMinute); err != nil {
 			t.Fatalf("processConnections nextMinute: %v", err)
 		}
 
 		currentTime = currentTime.Add(time.Minute)
-		if err := svc.processConnections(&connectionsResponse{}); err != nil {
+		if err := svc.processConnections(context.Background(), &connectionsResponse{}); err != nil {
 			t.Fatalf("processConnections quiet tick: %v", err)
 		}
 
@@ -2416,16 +2418,16 @@ func TestAutoRestore(t *testing.T) {
 		}
 
 		first, trigger := newTriggerResponses("video.example")
-		if err := svc.processConnections(first); err != nil {
+		if err := svc.processConnections(context.Background(), first); err != nil {
 			t.Fatalf("processConnections first: %v", err)
 		}
-		if err := svc.processConnections(trigger); err != nil {
+		if err := svc.processConnections(context.Background(), trigger); err != nil {
 			t.Fatalf("processConnections trigger: %v", err)
 		}
 
 		currentProxy = "🇯🇵 Japan"
 		currentTime = currentTime.Add(2 * time.Minute)
-		if err := svc.processConnections(&connectionsResponse{}); err != nil {
+		if err := svc.processConnections(context.Background(), &connectionsResponse{}); err != nil {
 			t.Fatalf("processConnections restore tick: %v", err)
 		}
 
@@ -2504,16 +2506,16 @@ func TestAutoRestore(t *testing.T) {
 		}
 
 		first, trigger := newTriggerResponses("video.example")
-		if err := svc.processConnections(first); err != nil {
+		if err := svc.processConnections(context.Background(), first); err != nil {
 			t.Fatalf("processConnections first: %v", err)
 		}
-		if err := svc.processConnections(trigger); err != nil {
+		if err := svc.processConnections(context.Background(), trigger); err != nil {
 			t.Fatalf("processConnections trigger: %v", err)
 		}
 
 		allList = []string{"🇸🇬 Singapore", "🇯🇵 Japan"}
 		currentTime = currentTime.Add(2 * time.Minute)
-		if err := svc.processConnections(&connectionsResponse{}); err != nil {
+		if err := svc.processConnections(context.Background(), &connectionsResponse{}); err != nil {
 			t.Fatalf("processConnections restore tick: %v", err)
 		}
 
@@ -4318,7 +4320,7 @@ func TestProcessConnectionsCapturesRuleGroup(t *testing.T) {
 		},
 	}
 
-	if err := svc.processConnections(payload); err != nil {
+	if err := svc.processConnections(context.Background(), payload); err != nil {
 		t.Fatalf("processConnections: %v", err)
 	}
 
@@ -4716,5 +4718,153 @@ func TestLegacyMatchRowsRelabeledOnce(t *testing.T) {
 	}
 	if unknown != 1 {
 		t.Errorf("expected 1 unknown aggregate row after relabel, got %d", unknown)
+	}
+}
+
+func TestApplicationServesAndShutsDownIdempotently(t *testing.T) {
+	app, err := newApplication(config{ListenAddr: "127.0.0.1:0"}, filepath.Join(t.TempDir(), "traffic.db"))
+	if err != nil {
+		t.Fatalf("newApplication: %v", err)
+	}
+
+	app.start()
+
+	resp, err := http.Get(fmt.Sprintf("http://%s/health", app.listener.Addr()))
+	if err != nil {
+		t.Fatalf("health request: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "ok") {
+		t.Fatalf("unexpected health response: %d %s", resp.StatusCode, body)
+	}
+
+	if err := app.shutdown(); err != nil {
+		t.Fatalf("first shutdown: %v", err)
+	}
+	if err := app.shutdown(); err != nil {
+		t.Fatalf("second shutdown must be idempotent: %v", err)
+	}
+
+	if _, err := http.Get(fmt.Sprintf("http://%s/health", app.listener.Addr())); err == nil {
+		t.Fatal("expected server to refuse connections after shutdown")
+	}
+}
+
+func TestApplicationPortConflictFailsSynchronously(t *testing.T) {
+	blocker, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("blocker listen: %v", err)
+	}
+	defer blocker.Close()
+
+	app, err := newApplication(config{ListenAddr: blocker.Addr().String()}, filepath.Join(t.TempDir(), "traffic.db"))
+	if err == nil {
+		app.shutdown()
+		t.Fatal("expected newApplication to fail while the port is occupied")
+	}
+	if app != nil {
+		t.Fatal("expected nil application on listen failure")
+	}
+}
+
+func TestApplicationServerErrorReachesErrorsChannel(t *testing.T) {
+	app, err := newApplication(config{ListenAddr: "127.0.0.1:0"}, filepath.Join(t.TempDir(), "traffic.db"))
+	if err != nil {
+		t.Fatalf("newApplication: %v", err)
+	}
+
+	app.start()
+	if err := app.listener.Close(); err != nil {
+		t.Fatalf("close listener: %v", err)
+	}
+
+	select {
+	case err := <-app.errors():
+		if err == nil {
+			t.Fatal("expected non-nil server error")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for server error")
+	}
+
+	if err := app.shutdown(); err != nil {
+		t.Fatalf("shutdown after server error: %v", err)
+	}
+}
+
+func TestApplicationShutdownSkipsFlushWhenCollectorStuck(t *testing.T) {
+	svc := newTestService(t)
+
+	previousTimeout := collectorShutdownTimeout
+	collectorShutdownTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { collectorShutdownTimeout = previousTimeout })
+
+	bucketStart := (time.Now().UnixMilli() / 60000) * 60000
+	svc.aggregateBuffer["stuck"] = &aggregatedEntry{
+		BucketStart: bucketStart,
+		BucketEnd:   bucketStart + 60000,
+		SourceIP:    "192.168.1.2",
+		Host:        "stuck.example",
+		Process:     "chrome",
+		Outbound:    "DIRECT",
+		Chains:      `["DIRECT"]`,
+		RuleGroup:   unknownRuleGroup,
+		Upload:      10,
+		Download:    5,
+		Count:       1,
+	}
+
+	app := &application{
+		cfg:           config{ListenAddr: "127.0.0.1:0"},
+		db:            svc.db,
+		svc:           svc,
+		server:        &http.Server{Handler: svc.routes(), ReadHeaderTimeout: 5 * time.Second},
+		ctx:           context.Background(),
+		cancel:        func() {},
+		collectorDone: make(chan struct{}),
+		serverErr:     make(chan error, 1),
+	}
+
+	err := app.shutdown()
+	if err == nil {
+		t.Fatal("expected shutdown error while the collector is stuck")
+	}
+	if !strings.Contains(err.Error(), "skipping final flush") {
+		t.Fatalf("expected skip-final-flush error, got %v", err)
+	}
+
+	var flushed int
+	if err := svc.db.QueryRow(`SELECT COUNT(*) FROM traffic_aggregated`).Scan(&flushed); err != nil {
+		t.Fatalf("query aggregated after skipped flush: %v", err)
+	}
+	if flushed != 0 {
+		t.Fatalf("expected no aggregates flushed during timed-out shutdown, got %d", flushed)
+	}
+}
+
+func TestExecuteAutoSwitchRespectsContextCancellation(t *testing.T) {
+	svc := newTestService(t)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer ts.Close()
+
+	svc.setMihomoSettings(mihomoSettings{URL: ts.URL})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+	}()
+
+	target := autoSwitchGroupTarget{GroupName: "G", TargetProxy: "P", Enabled: true}
+	_, err := svc.executeAutoSwitch(ctx, autoSwitchSettings{Enabled: true, GroupTargets: []autoSwitchGroupTarget{target}}, target, time.Now().UnixMilli(), "example.com", 100)
+	if err == nil {
+		t.Fatal("expected context cancellation error from blocked auto switch request")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
 	}
 }
